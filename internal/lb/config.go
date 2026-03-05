@@ -1,0 +1,191 @@
+package lb
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	toml "github.com/pelletier/go-toml/v2"
+)
+
+type configFile struct {
+	Proxy  configProxy  `toml:"proxy"`
+	Policy configPolicy `toml:"policy"`
+	Quota  configQuota  `toml:"quota"`
+}
+
+type configProxy struct {
+	Listen                 string `toml:"listen"`
+	UpstreamBaseURL        string `toml:"upstream_base_url"`
+	MaxAttempts            int    `toml:"max_attempts"`
+	UsageTimeoutMS         int    `toml:"usage_timeout_ms"`
+	CooldownDefaultSeconds int    `toml:"cooldown_default_seconds"`
+}
+
+type configPolicy struct {
+	Mode         string        `toml:"mode"`
+	DeltaPercent float64       `toml:"delta_percent"`
+	Weights      configWeights `toml:"weights"`
+}
+
+type configWeights struct {
+	Daily  float64 `toml:"daily"`
+	Weekly float64 `toml:"weekly"`
+}
+
+type configQuota struct {
+	RefreshIntervalMinutes  int `toml:"refresh_interval_minutes"`
+	RefreshIntervalMessages int `toml:"refresh_interval_messages"`
+	CacheTTLMinutes         int `toml:"cache_ttl_minutes"`
+}
+
+type partialConfigFile struct {
+	Proxy  *partialConfigProxy  `toml:"proxy"`
+	Policy *partialConfigPolicy `toml:"policy"`
+	Quota  *partialConfigQuota  `toml:"quota"`
+}
+
+type partialConfigProxy struct {
+	Listen                 *string `toml:"listen"`
+	UpstreamBaseURL        *string `toml:"upstream_base_url"`
+	MaxAttempts            *int    `toml:"max_attempts"`
+	UsageTimeoutMS         *int    `toml:"usage_timeout_ms"`
+	CooldownDefaultSeconds *int    `toml:"cooldown_default_seconds"`
+}
+
+type partialConfigPolicy struct {
+	Mode         *string               `toml:"mode"`
+	DeltaPercent *float64              `toml:"delta_percent"`
+	Weights      *partialConfigWeights `toml:"weights"`
+}
+
+type partialConfigWeights struct {
+	Daily  *float64 `toml:"daily"`
+	Weekly *float64 `toml:"weekly"`
+}
+
+type partialConfigQuota struct {
+	RefreshIntervalMinutes  *int `toml:"refresh_interval_minutes"`
+	RefreshIntervalMessages *int `toml:"refresh_interval_messages"`
+	CacheTTLMinutes         *int `toml:"cache_ttl_minutes"`
+}
+
+func ConfigPath(root string) string {
+	return filepath.Join(root, "config.toml")
+}
+
+func loadOrCreateSettingsConfig(root string, fallback Settings) (Settings, error) {
+	path := ConfigPath(root)
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if err := WriteSettingsConfig(root, fallback); err != nil {
+				return Settings{}, err
+			}
+			return fallback, nil
+		}
+		return Settings{}, fmt.Errorf("read config.toml: %w", err)
+	}
+
+	var partial partialConfigFile
+	if err := toml.Unmarshal(bytes, &partial); err != nil {
+		return Settings{}, fmt.Errorf("parse config.toml: %w", err)
+	}
+
+	out := fallback
+	if partial.Proxy != nil {
+		if partial.Proxy.Listen != nil {
+			out.Proxy.Listen = strings.TrimSpace(*partial.Proxy.Listen)
+		}
+		if partial.Proxy.UpstreamBaseURL != nil {
+			out.Proxy.UpstreamBaseURL = strings.TrimRight(strings.TrimSpace(*partial.Proxy.UpstreamBaseURL), "/")
+		}
+		if partial.Proxy.MaxAttempts != nil {
+			out.Proxy.MaxAttempts = *partial.Proxy.MaxAttempts
+		}
+		if partial.Proxy.UsageTimeoutMS != nil {
+			out.Proxy.UsageTimeoutMS = *partial.Proxy.UsageTimeoutMS
+		}
+		if partial.Proxy.CooldownDefaultSeconds != nil {
+			out.Proxy.CooldownDefaultS = *partial.Proxy.CooldownDefaultSeconds
+		}
+	}
+	if partial.Policy != nil {
+		if partial.Policy.Mode != nil {
+			switch PolicyMode(strings.TrimSpace(*partial.Policy.Mode)) {
+			case PolicyUsageBalanced, PolicyRoundRobin, PolicySticky:
+				out.Policy.Mode = PolicyMode(strings.TrimSpace(*partial.Policy.Mode))
+			}
+		}
+		if partial.Policy.DeltaPercent != nil {
+			out.Policy.DeltaPercent = *partial.Policy.DeltaPercent
+		}
+		if partial.Policy.Weights != nil {
+			if partial.Policy.Weights.Daily != nil {
+				out.Policy.Weights.Daily = *partial.Policy.Weights.Daily
+			}
+			if partial.Policy.Weights.Weekly != nil {
+				out.Policy.Weights.Weekly = *partial.Policy.Weights.Weekly
+			}
+		}
+	}
+	if partial.Quota != nil {
+		if partial.Quota.RefreshIntervalMinutes != nil {
+			out.Quota.RefreshIntervalMinutes = *partial.Quota.RefreshIntervalMinutes
+		}
+		if partial.Quota.RefreshIntervalMessages != nil {
+			out.Quota.RefreshIntervalMessages = *partial.Quota.RefreshIntervalMessages
+		}
+		if partial.Quota.CacheTTLMinutes != nil {
+			out.Quota.CacheTTLMinutes = *partial.Quota.CacheTTLMinutes
+		}
+	}
+
+	// Keep merged settings normalized with defaults/ranges.
+	tmp := defaultStore()
+	tmp.Settings = out
+	out = mergeDefaults(tmp).Settings
+
+	return out, nil
+}
+
+func WriteSettingsConfig(root string, settings Settings) error {
+	path := ConfigPath(root)
+	cfg := settingsToConfig(settings)
+	encoded, err := toml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config.toml: %w", err)
+	}
+	content := []byte("# codexlb configuration\n# Edit these values to tune proxy/account selection behavior.\n\n")
+	content = append(content, encoded...)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		return fmt.Errorf("write config.toml: %w", err)
+	}
+	return nil
+}
+
+func settingsToConfig(settings Settings) configFile {
+	return configFile{
+		Proxy: configProxy{
+			Listen:                 settings.Proxy.Listen,
+			UpstreamBaseURL:        settings.Proxy.UpstreamBaseURL,
+			MaxAttempts:            settings.Proxy.MaxAttempts,
+			UsageTimeoutMS:         settings.Proxy.UsageTimeoutMS,
+			CooldownDefaultSeconds: settings.Proxy.CooldownDefaultS,
+		},
+		Policy: configPolicy{
+			Mode:         string(settings.Policy.Mode),
+			DeltaPercent: settings.Policy.DeltaPercent,
+			Weights: configWeights{
+				Daily:  settings.Policy.Weights.Daily,
+				Weekly: settings.Policy.Weights.Weekly,
+			},
+		},
+		Quota: configQuota{
+			RefreshIntervalMinutes:  settings.Quota.RefreshIntervalMinutes,
+			RefreshIntervalMessages: settings.Quota.RefreshIntervalMessages,
+			CacheTTLMinutes:         settings.Quota.CacheTTLMinutes,
+		},
+	}
+}

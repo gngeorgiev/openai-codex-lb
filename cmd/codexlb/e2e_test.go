@@ -1,0 +1,117 @@
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestE2EWrapperLoginAndRun(t *testing.T) {
+	root := t.TempDir()
+	fakeLog := filepath.Join(root, "fake-codex.log")
+	fakeBin := filepath.Join(root, "codex")
+	writeFakeCodex(t, fakeBin)
+
+	t.Setenv("CODEXLB_CODEX_BIN", fakeBin)
+	t.Setenv("FAKE_LOG", fakeLog)
+
+	t.Setenv("FAKE_TOKEN", testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-a"},
+		"https://api.openai.com/profile": map[string]any{"email": "a@example.com"},
+	}))
+	t.Setenv("FAKE_ACCOUNT_ID", "acct-a")
+	if code := run([]string{"account", "login", "--root", root, "alice"}); code != 0 {
+		t.Fatalf("account login alice failed: %d", code)
+	}
+
+	t.Setenv("FAKE_TOKEN", testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-b"},
+		"https://api.openai.com/profile": map[string]any{"email": "b@example.com"},
+	}))
+	t.Setenv("FAKE_ACCOUNT_ID", "acct-b")
+	if code := run([]string{"account", "login", "--root", root, "bob"}); code != 0 {
+		t.Fatalf("account login bob failed: %d", code)
+	}
+
+	if code := run([]string{"account", "list", "--root", root}); code != 0 {
+		t.Fatalf("account list failed: %d", code)
+	}
+
+	runtimeHome := filepath.Join(root, "runtime-home")
+	if code := run([]string{"run", "--root", root, "--proxy-url", "http://127.0.0.1:9876", "--codex-home", runtimeHome, "exec", "--json", "ping"}); code != 0 {
+		t.Fatalf("wrapper run failed: %d", code)
+	}
+
+	data, err := os.ReadFile(fakeLog)
+	if err != nil {
+		t.Fatalf("read fake log: %v", err)
+	}
+	logLine := string(data)
+	if !strings.Contains(logLine, "OPENAI_BASE_URL=http://127.0.0.1:9876") {
+		t.Fatalf("missing OPENAI_BASE_URL in log: %s", logLine)
+	}
+	if !strings.Contains(logLine, "OPENAI_API_KEY=codex-lb-local-key") {
+		t.Fatalf("missing OPENAI_API_KEY in log: %s", logLine)
+	}
+	if !strings.Contains(logLine, "CODEX_HOME="+runtimeHome) {
+		t.Fatalf("missing CODEX_HOME override in log: %s", logLine)
+	}
+}
+
+func TestE2EAccountImport(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	token := testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-import"},
+		"https://api.openai.com/profile": map[string]any{"email": "import@example.com"},
+	})
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"tokens":{"access_token":"`+token+`","account_id":"acct-import"}}`), 0o600); err != nil {
+		t.Fatalf("write source auth: %v", err)
+	}
+
+	if code := run([]string{"account", "import", "--root", root, "--from", source, "imported"}); code != 0 {
+		t.Fatalf("account import failed: %d", code)
+	}
+
+	copied := filepath.Join(root, "accounts", "imported", "auth.json")
+	if _, err := os.Stat(copied); err != nil {
+		t.Fatalf("expected copied auth at %s: %v", copied, err)
+	}
+}
+
+func writeFakeCodex(t *testing.T, path string) {
+	t.Helper()
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "login" ]]; then
+  mkdir -p "$CODEX_HOME"
+  cat > "$CODEX_HOME/auth.json" <<JSON
+{"tokens":{"access_token":"${FAKE_TOKEN:?missing FAKE_TOKEN}","account_id":"${FAKE_ACCOUNT_ID:-}"}}
+JSON
+  exit 0
+fi
+{
+  echo "OPENAI_BASE_URL=${OPENAI_BASE_URL:-}";
+  echo "OPENAI_API_KEY=${OPENAI_API_KEY:-}";
+  echo "CODEX_HOME=${CODEX_HOME:-}";
+  echo "ARGS=$*";
+} >> "${FAKE_LOG:?missing FAKE_LOG}"
+exit 0
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake codex script: %v", err)
+	}
+}
+
+func testJWT(payload map[string]any) string {
+	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	b, _ := json.Marshal(payload)
+	body := base64.RawURLEncoding.EncodeToString(b)
+	return head + "." + body + ".sig"
+}
