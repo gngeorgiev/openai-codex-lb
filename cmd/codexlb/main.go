@@ -405,6 +405,7 @@ func runStatus(argv []string) int {
 	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: http://<listen-from-store>)")
 	timeout := fs.Duration("timeout", 3*time.Second, "HTTP timeout for status request")
 	jsonOut := fs.Bool("json", false, "Print raw JSON status output")
+	shortOut := fs.Bool("short", false, "Print one-line status for status bars")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb status [flags]
 
@@ -417,11 +418,16 @@ Flags:
 Examples:
   codexlb status
   codexlb status --proxy-url http://127.0.0.1:8765
+  codexlb status --short
   codexlb status --json
 `)
 	}
 	if err := fs.Parse(argv); err != nil {
 		return parseFlagError(err)
+	}
+	if *jsonOut && *shortOut {
+		fmt.Fprintln(os.Stderr, "status flags --json and --short are mutually exclusive")
+		return 2
 	}
 
 	store, err := lb.OpenStore(*root)
@@ -466,8 +472,25 @@ Examples:
 		fmt.Fprintf(os.Stderr, "decode status JSON: %v\n", err)
 		return 1
 	}
+	if *shortOut {
+		printStatusShort(status)
+		return 0
+	}
 	printStatusTable(status)
 	return 0
+}
+
+func printStatusShort(status lb.ProxyStatus) {
+	active := "none"
+	for _, a := range status.Accounts {
+		if a.Active {
+			active = a.Alias
+			break
+		}
+	}
+	reason := noneIfEmpty(status.SelectionReason)
+	mode := noneIfEmpty(string(status.Policy.Mode))
+	fmt.Printf("lb=%s reason=%s mode=%s\n", active, reason, mode)
 }
 
 func printStatusTable(status lb.ProxyStatus) {

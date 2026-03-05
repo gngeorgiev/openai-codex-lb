@@ -303,12 +303,13 @@ Flags:
 - `--root` state directory (used to resolve default proxy URL)
 - `--proxy-url` explicit proxy URL override
 - `--timeout` HTTP timeout for status request (default `3s`)
+- `--short` one-line output (`lb=<alias> reason=<switch-reason> mode=<policy>`) for status bars
 - `--json` print raw JSON instead of table
 
 Usage:
 
 ```bash
-codexlb status [--root DIR] [--proxy-url URL] [--timeout 3s] [--json]
+codexlb status [--root DIR] [--proxy-url URL] [--timeout 3s] [--short | --json]
 ```
 
 ## Make Targets
