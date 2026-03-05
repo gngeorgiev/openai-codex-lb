@@ -96,6 +96,15 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/admin/") {
+		status := p.handleAdmin(w, r)
+		p.logEvent("request.completed", map[string]any{
+			"req_id": reqID,
+			"status": status,
+			"path":   r.URL.Path,
+		})
+		return
+	}
 	if r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"ok":true,"service":"codexlb-proxy"}`)
@@ -125,6 +134,149 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.handleHTTP(w, r, now, reqID)
+}
+
+func (p *ProxyServer) handleAdmin(w http.ResponseWriter, r *http.Request) int {
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/admin/accounts":
+		snapshot := p.store.Snapshot()
+		writeJSON(w, http.StatusOK, AdminAccountsResponse{Accounts: snapshot.Accounts})
+		return http.StatusOK
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/account/login":
+		var req AdminLoginRequest
+		if err := decodeJSONBody(r, &req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid login request: %v", err))
+			return http.StatusBadRequest
+		}
+		if strings.TrimSpace(req.Alias) == "" {
+			writeJSONError(w, http.StatusBadRequest, "alias is required")
+			return http.StatusBadRequest
+		}
+		if err := LoginAccount(p.store, req.Alias, req.CodexBin, req.LoginArgs); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return http.StatusBadRequest
+		}
+		total := len(p.store.Snapshot().Accounts)
+		writeJSON(w, http.StatusOK, AdminMutationResponse{
+			OK:      true,
+			Message: fmt.Sprintf("registered account %s", req.Alias),
+			Total:   total,
+		})
+		return http.StatusOK
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/account/import":
+		var req AdminImportRequest
+		if err := decodeJSONBody(r, &req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid import request: %v", err))
+			return http.StatusBadRequest
+		}
+		if strings.TrimSpace(req.Alias) == "" || strings.TrimSpace(req.FromHome) == "" {
+			writeJSONError(w, http.StatusBadRequest, "alias and from_home are required")
+			return http.StatusBadRequest
+		}
+		if err := ImportAccount(p.store, req.Alias, req.FromHome); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return http.StatusBadRequest
+		}
+		total := len(p.store.Snapshot().Accounts)
+		writeJSON(w, http.StatusOK, AdminMutationResponse{
+			OK:      true,
+			Message: fmt.Sprintf("imported account %s", req.Alias),
+			Total:   total,
+		})
+		return http.StatusOK
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/account/rm":
+		var req AdminAliasRequest
+		if err := decodeJSONBody(r, &req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid rm request: %v", err))
+			return http.StatusBadRequest
+		}
+		if strings.TrimSpace(req.Alias) == "" {
+			writeJSONError(w, http.StatusBadRequest, "alias is required")
+			return http.StatusBadRequest
+		}
+		if err := RemoveAccount(p.store, req.Alias); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
+			return http.StatusBadRequest
+		}
+		total := len(p.store.Snapshot().Accounts)
+		writeJSON(w, http.StatusOK, AdminMutationResponse{
+			OK:      true,
+			Message: fmt.Sprintf("removed account %s", req.Alias),
+			Total:   total,
+		})
+		return http.StatusOK
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/account/pin":
+		var req AdminAliasRequest
+		if err := decodeJSONBody(r, &req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid pin request: %v", err))
+			return http.StatusBadRequest
+		}
+		if strings.TrimSpace(req.Alias) == "" {
+			writeJSONError(w, http.StatusBadRequest, "alias is required")
+			return http.StatusBadRequest
+		}
+		snapshot := p.store.Snapshot()
+		pinnedID := ""
+		for _, account := range snapshot.Accounts {
+			if account.Alias == req.Alias {
+				pinnedID = account.ID
+				break
+			}
+		}
+		if pinnedID == "" {
+			writeJSONError(w, http.StatusNotFound, fmt.Sprintf("alias not found: %s", req.Alias))
+			return http.StatusNotFound
+		}
+		if err := p.store.Update(func(sf *StoreFile) error {
+			sf.State.PinnedAccountID = pinnedID
+			return nil
+		}); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return http.StatusInternalServerError
+		}
+		total := len(p.store.Snapshot().Accounts)
+		writeJSON(w, http.StatusOK, AdminMutationResponse{
+			OK:      true,
+			Message: fmt.Sprintf("pinned account %s", req.Alias),
+			Total:   total,
+		})
+		return http.StatusOK
+	case r.Method == http.MethodPost && r.URL.Path == "/admin/account/unpin":
+		if err := p.store.Update(func(sf *StoreFile) error {
+			sf.State.PinnedAccountID = ""
+			return nil
+		}); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error())
+			return http.StatusInternalServerError
+		}
+		total := len(p.store.Snapshot().Accounts)
+		writeJSON(w, http.StatusOK, AdminMutationResponse{
+			OK:      true,
+			Message: "unpinned account selection",
+			Total:   total,
+		})
+		return http.StatusOK
+	default:
+		writeJSONError(w, http.StatusNotFound, "admin endpoint not found")
+		return http.StatusNotFound
+	}
+}
+
+func decodeJSONBody(r *http.Request, dst any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(dst)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{"error": message})
 }
 
 func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, now time.Time, reqID uint64) {

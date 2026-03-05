@@ -1,6 +1,8 @@
 package lb
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,8 +167,8 @@ func resolveCodexInvocation(store *Store, codexBin, proxyURL, codexHome string, 
 	}
 	snapshot := store.Snapshot()
 	if proxyURL == "" {
-		if snapshot.Settings.Run.ProxyURL != "" {
-			proxyURL = snapshot.Settings.Run.ProxyURL
+		if snapshot.Settings.ProxyURL != "" {
+			proxyURL = snapshot.Settings.ProxyURL
 		} else {
 			proxyURL = "http://" + snapshot.Settings.Proxy.Listen
 		}
@@ -192,44 +194,69 @@ func resolveCodexInvocation(store *Store, codexBin, proxyURL, codexHome string, 
 func seedRuntimeAuthIfMissing(store *Store, codexHome string) error {
 	targetAuth := filepath.Join(codexHome, "auth.json")
 	if _, err := os.Stat(targetAuth); err == nil {
-		return nil
+		// Keep existing runtime auth when parseable; otherwise refresh below.
+		if _, loadErr := LoadAuth(codexHome); loadErr == nil {
+			return nil
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat runtime auth.json: %w", err)
 	}
 
 	snapshot := store.Snapshot()
-	if len(snapshot.Accounts) == 0 {
-		return nil
+	if len(snapshot.Accounts) > 0 {
+		candidates := make([]int, 0, len(snapshot.Accounts))
+		if snapshot.State.ActiveIndex >= 0 && snapshot.State.ActiveIndex < len(snapshot.Accounts) {
+			candidates = append(candidates, snapshot.State.ActiveIndex)
+		}
+		for i := range snapshot.Accounts {
+			if i == snapshot.State.ActiveIndex {
+				continue
+			}
+			candidates = append(candidates, i)
+		}
+
+		for _, idx := range candidates {
+			home := snapshot.Accounts[idx].HomeDir
+			sourceAuth := filepath.Join(home, "auth.json")
+			if _, err := os.Stat(sourceAuth); err != nil {
+				continue
+			}
+			if err := copyFile(sourceAuth, targetAuth, 0o600); err != nil {
+				return fmt.Errorf("seed runtime auth.json from account %s: %w", snapshot.Accounts[idx].Alias, err)
+			}
+			sourceConfig := filepath.Join(home, "config.toml")
+			targetConfig := filepath.Join(codexHome, "config.toml")
+			if _, err := os.Stat(sourceConfig); err == nil {
+				_ = copyFile(sourceConfig, targetConfig, 0o600)
+			}
+			return nil
+		}
 	}
 
-	candidates := make([]int, 0, len(snapshot.Accounts))
-	if snapshot.State.ActiveIndex >= 0 && snapshot.State.ActiveIndex < len(snapshot.Accounts) {
-		candidates = append(candidates, snapshot.State.ActiveIndex)
-	}
-	for i := range snapshot.Accounts {
-		if i == snapshot.State.ActiveIndex {
-			continue
-		}
-		candidates = append(candidates, i)
-	}
-
-	for _, idx := range candidates {
-		home := snapshot.Accounts[idx].HomeDir
-		sourceAuth := filepath.Join(home, "auth.json")
-		if _, err := os.Stat(sourceAuth); err != nil {
-			continue
-		}
-		if err := copyFile(sourceAuth, targetAuth, 0o600); err != nil {
-			return fmt.Errorf("seed runtime auth.json from account %s: %w", snapshot.Accounts[idx].Alias, err)
-		}
-		sourceConfig := filepath.Join(home, "config.toml")
-		targetConfig := filepath.Join(codexHome, "config.toml")
-		if _, err := os.Stat(sourceConfig); err == nil {
-			_ = copyFile(sourceConfig, targetConfig, 0o600)
-		}
-		return nil
+	if err := writeProxyOnlyRuntimeAuth(targetAuth); err != nil {
+		return fmt.Errorf("write proxy-only runtime auth.json: %w", err)
 	}
 	return nil
+}
+
+func writeProxyOnlyRuntimeAuth(path string) error {
+	payload := map[string]any{
+		"tokens": map[string]any{
+			"access_token": buildProxyOnlyAccessToken(),
+			"account_id":   "proxy-only",
+		},
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
+func buildProxyOnlyAccessToken() string {
+	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	body := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"codexlb-proxy-only","exp":4102444800}`))
+	return head + "." + body + ".sig"
 }
 
 func formatShellCommand(bin string, args []string, env map[string]string) string {

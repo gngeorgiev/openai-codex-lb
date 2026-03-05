@@ -44,12 +44,12 @@ type CommandConfig struct {
 }
 
 type RunConfig struct {
-	ProxyURL     string `json:"proxy_url"`
-	InheritShell bool   `json:"inherit_shell"`
+	InheritShell bool `json:"inherit_shell"`
 }
 
 type Settings struct {
 	Proxy    ProxyConfig   `json:"proxy"`
+	ProxyURL string        `json:"proxy_url"`
 	Policy   PolicyConfig  `json:"policy"`
 	Quota    QuotaConfig   `json:"quota"`
 	Commands CommandConfig `json:"commands"`
@@ -110,6 +110,7 @@ func defaultStore() StoreFile {
 				UsageTimeoutMS:   15000,
 				CooldownDefaultS: 5,
 			},
+			ProxyURL: "",
 			Policy: PolicyConfig{
 				Mode:         PolicyUsageBalanced,
 				DeltaPercent: 10,
@@ -128,7 +129,6 @@ func defaultStore() StoreFile {
 				Run:   []string{},
 			},
 			Run: RunConfig{
-				ProxyURL:     "",
 				InheritShell: true,
 			},
 		},
@@ -197,7 +197,7 @@ func mergeDefaults(in StoreFile) StoreFile {
 		}
 	}
 	out.Settings.Commands.Run = sanitizeCommand(out.Settings.Commands.Run)
-	out.Settings.Run.ProxyURL = strings.TrimSpace(out.Settings.Run.ProxyURL)
+	out.Settings.ProxyURL = strings.TrimSpace(out.Settings.ProxyURL)
 
 	for i := range out.Accounts {
 		if out.Accounts[i].BaseURL == "" {

@@ -182,7 +182,7 @@ Examples:
 func runProxyLogs(argv []string) int {
 	fs := flag.NewFlagSet("proxy logs", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: run.proxy_url or http://<listen-from-store>)")
+	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: proxy.proxy_url or http://<listen-from-store>)")
 	tail := fs.Int("tail", 100, "Number of most recent log lines for initial fetch")
 	offset := fs.Int64("offset", -1, "Start reading from byte offset (overrides --tail)")
 	limit := fs.Int("limit", 500, "Maximum lines per request")
@@ -314,6 +314,7 @@ func runAccount(argv []string) int {
 func runAccountLogin(argv []string) int {
 	fs := flag.NewFlagSet("account login", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
 	codexBin := fs.String("codex-bin", os.Getenv("CODEXLB_CODEX_BIN"), "Codex executable path")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account login [flags] <alias> [-- <codex-login-args...>]
@@ -337,6 +338,15 @@ Flags:
 	if len(args) > 1 {
 		loginArgs = args[1:]
 	}
+	if strings.TrimSpace(*proxyURL) != "" {
+		resp, err := remoteAdminLogin(*proxyURL, alias, *codexBin, loginArgs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "login account (remote): %v\n", err)
+			return 1
+		}
+		fmt.Printf("registered account %s (total=%d)\n", alias, resp.Total)
+		return 0
+	}
 
 	store, err := lb.OpenStore(*root)
 	if err != nil {
@@ -355,6 +365,7 @@ Flags:
 func runAccountImport(argv []string) int {
 	fs := flag.NewFlagSet("account import", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
 	from := fs.String("from", "", "Existing CODEX_HOME directory to import from")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account import [flags] --from <CODEX_HOME> <alias>
@@ -374,6 +385,15 @@ Flags:
 		return 2
 	}
 	alias := args[0]
+	if strings.TrimSpace(*proxyURL) != "" {
+		resp, err := remoteAdminImport(*proxyURL, alias, *from)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "import account (remote): %v\n", err)
+			return 1
+		}
+		fmt.Printf("imported account %s (total=%d)\n", alias, resp.Total)
+		return 0
+	}
 
 	store, err := lb.OpenStore(*root)
 	if err != nil {
@@ -392,6 +412,7 @@ Flags:
 func runAccountList(argv []string) int {
 	fs := flag.NewFlagSet("account list", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account list [flags]
 
@@ -404,36 +425,28 @@ Flags:
 	if err := fs.Parse(argv); err != nil {
 		return parseFlagError(err)
 	}
+	if strings.TrimSpace(*proxyURL) != "" {
+		accounts, err := remoteAdminListAccounts(*proxyURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "list accounts (remote): %v\n", err)
+			return 1
+		}
+		printAccountList(accounts)
+		return 0
+	}
 	store, err := lb.OpenStore(*root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	accounts := lb.ListAccounts(store)
-	if len(accounts) == 0 {
-		fmt.Println("no accounts")
-		return 0
-	}
-	for _, account := range accounts {
-		status := "ready"
-		if !account.Enabled || account.DisabledReason != "" {
-			status = "disabled"
-		}
-		if account.CooldownUntilMS > time.Now().UnixMilli() {
-			status = fmt.Sprintf("cooldown(%ds)", int((account.CooldownUntilMS-time.Now().UnixMilli())/1000)+1)
-		}
-		email := account.UserEmail
-		if email == "" {
-			email = "-"
-		}
-		fmt.Printf("%s\t%s\t%s\t%s\n", account.Alias, account.ID, email, status)
-	}
+	printAccountList(lb.ListAccounts(store))
 	return 0
 }
 
 func runAccountRemove(argv []string) int {
 	fs := flag.NewFlagSet("account rm", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account rm [flags] <alias>
 
@@ -451,6 +464,14 @@ Flags:
 		fs.Usage()
 		return 2
 	}
+	if strings.TrimSpace(*proxyURL) != "" {
+		if _, err := remoteAdminRemove(*proxyURL, args[0]); err != nil {
+			fmt.Fprintf(os.Stderr, "remove account (remote): %v\n", err)
+			return 1
+		}
+		fmt.Printf("removed account %s\n", args[0])
+		return 0
+	}
 	store, err := lb.OpenStore(*root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
@@ -467,6 +488,7 @@ Flags:
 func runAccountPin(argv []string) int {
 	fs := flag.NewFlagSet("account pin", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account pin [flags] <alias>
 
@@ -485,6 +507,14 @@ Flags:
 		return 2
 	}
 	alias := args[0]
+	if strings.TrimSpace(*proxyURL) != "" {
+		if _, err := remoteAdminPin(*proxyURL, alias); err != nil {
+			fmt.Fprintf(os.Stderr, "pin account (remote): %v\n", err)
+			return 1
+		}
+		fmt.Printf("pinned account %s\n", alias)
+		return 0
+	}
 
 	store, err := lb.OpenStore(*root)
 	if err != nil {
@@ -517,6 +547,7 @@ Flags:
 func runAccountUnpin(argv []string) int {
 	fs := flag.NewFlagSet("account unpin", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account unpin [flags]
 
@@ -532,6 +563,14 @@ Flags:
 	if len(fs.Args()) != 0 {
 		fs.Usage()
 		return 2
+	}
+	if strings.TrimSpace(*proxyURL) != "" {
+		if _, err := remoteAdminUnpin(*proxyURL); err != nil {
+			fmt.Fprintf(os.Stderr, "unpin account (remote): %v\n", err)
+			return 1
+		}
+		fmt.Println("unpinned account selection")
+		return 0
 	}
 
 	store, err := lb.OpenStore(*root)
@@ -550,10 +589,31 @@ Flags:
 	return 0
 }
 
+func printAccountList(accounts []lb.Account) {
+	if len(accounts) == 0 {
+		fmt.Println("no accounts")
+		return
+	}
+	for _, account := range accounts {
+		status := "ready"
+		if !account.Enabled || account.DisabledReason != "" {
+			status = "disabled"
+		}
+		if account.CooldownUntilMS > time.Now().UnixMilli() {
+			status = fmt.Sprintf("cooldown(%ds)", int((account.CooldownUntilMS-time.Now().UnixMilli())/1000)+1)
+		}
+		email := account.UserEmail
+		if email == "" {
+			email = "-"
+		}
+		fmt.Printf("%s\t%s\t%s\t%s\n", account.Alias, account.ID, email, status)
+	}
+}
+
 func runCodex(argv []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: run.proxy_url or http://<listen-from-store>)")
+	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: proxy.proxy_url or http://<listen-from-store>)")
 	codexBin := fs.String("codex-bin", os.Getenv("CODEXLB_CODEX_BIN"), "Codex executable path")
 	codexHome := fs.String("codex-home", "", "CODEX_HOME for wrapper-run command")
 	commandOnly := fs.Bool("command", false, "Print wrapped codex command and exit")
@@ -598,7 +658,7 @@ Examples:
 func runStatus(argv []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: run.proxy_url or http://<listen-from-store>)")
+	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: proxy.proxy_url or http://<listen-from-store>)")
 	timeout := fs.Duration("timeout", 3*time.Second, "HTTP timeout for status request")
 	jsonOut := fs.Bool("json", false, "Print raw JSON status output")
 	shortOut := fs.Bool("short", false, "Print one-line status for status bars")
@@ -678,8 +738,8 @@ func resolveProxyURL(store *lb.Store, proxyURL string) string {
 		return url
 	}
 	snapshot := store.Snapshot()
-	if snapshot.Settings.Run.ProxyURL != "" {
-		return snapshot.Settings.Run.ProxyURL
+	if snapshot.Settings.ProxyURL != "" {
+		return snapshot.Settings.ProxyURL
 	}
 	return "http://" + snapshot.Settings.Proxy.Listen
 }

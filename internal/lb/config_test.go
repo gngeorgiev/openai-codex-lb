@@ -47,6 +47,8 @@ max_attempts = 7
 usage_timeout_ms = 1234
 cooldown_default_seconds = 9
 
+proxy_url = "http://127.0.0.1:19000"
+
 [policy]
 mode = "sticky"
 delta_percent = 5
@@ -65,7 +67,6 @@ login = ["login", "--device-code"]
 run = ["exec", "--yolo"]
 
 [run]
-proxy_url = "http://127.0.0.1:19000"
 inherit_shell = false
 `
 	if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte(custom), 0o600); err != nil {
@@ -95,8 +96,8 @@ inherit_shell = false
 	if len(snap.Settings.Commands.Run) != 2 || snap.Settings.Commands.Run[1] != "--yolo" {
 		t.Fatalf("commands.run not loaded: %#v", snap.Settings.Commands.Run)
 	}
-	if snap.Settings.Run.ProxyURL != "http://127.0.0.1:19000" {
-		t.Fatalf("run.proxy_url not loaded: %s", snap.Settings.Run.ProxyURL)
+	if snap.Settings.ProxyURL != "http://127.0.0.1:19000" {
+		t.Fatalf("proxy_url not loaded: %s", snap.Settings.ProxyURL)
 	}
 	if snap.Settings.Run.InheritShell {
 		t.Fatalf("run.inherit_shell not loaded")
@@ -145,10 +146,30 @@ listen = "127.0.0.1:8765"
 		t.Fatalf("OpenStore: %v", err)
 	}
 
-	if got := store.Snapshot().Settings.Run.ProxyURL; got != "" {
-		t.Fatalf("expected run.proxy_url to come from config/defaults, got %q", got)
+	if got := store.Snapshot().Settings.ProxyURL; got != "" {
+		t.Fatalf("expected proxy_url to come from config/defaults, got %q", got)
 	}
 	if !store.Snapshot().Settings.Run.InheritShell {
 		t.Fatalf("expected default run.inherit_shell=true")
+	}
+}
+
+func TestOpenStoreLoadsLegacyRunProxyURLFromConfigToml(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	custom := `
+[run]
+proxy_url = "http://legacy-proxy.local"
+`
+	if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte(custom), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	if got := store.Snapshot().Settings.ProxyURL; got != "http://legacy-proxy.local" {
+		t.Fatalf("expected legacy run.proxy_url to be loaded, got %q", got)
 	}
 }

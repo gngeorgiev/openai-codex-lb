@@ -91,6 +91,10 @@ This file is the source of truth for settings.
 [proxy]
 listen = "127.0.0.1:8765"
 upstream_base_url = "https://chatgpt.com/backend-api"
+# Global default URL used by commands that talk to the proxy
+# (`run`, `status`, and `proxy logs`) when --proxy-url is not provided.
+# If empty, falls back to "http://<proxy.listen>".
+proxy_url = ""
 max_attempts = 3
 usage_timeout_ms = 15000
 cooldown_default_seconds = 5
@@ -117,9 +121,6 @@ login = ["login"]
 run = ["exec", "--yolo"]
 
 [run]
-# Default URL used by `codexlb run` when --proxy-url is not provided.
-# If empty, falls back to "http://<proxy.listen>".
-proxy_url = ""
 # Run codex via the current shell (`$SHELL -lc ...`).
 inherit_shell = true
 ```
@@ -231,12 +232,13 @@ Create/use `~/.codex-lb/accounts/<alias>` as `CODEX_HOME` and execute login comm
 Usage:
 
 ```bash
-codexlb account login [--root DIR] [--codex-bin PATH] <alias> [-- <extra-login-args...>]
+codexlb account login [--root DIR] [--proxy-url URL] [--codex-bin PATH] <alias> [-- <extra-login-args...>]
 ```
 
 Notes:
 
 - `commands.login` is prepended before extra args.
+- With `--proxy-url`, executes login on the remote proxy admin API.
 
 ### `codexlb account import`
 
@@ -245,8 +247,12 @@ Import an existing Codex home auth.
 Usage:
 
 ```bash
-codexlb account import [--root DIR] --from <CODEX_HOME> <alias>
+codexlb account import [--root DIR] [--proxy-url URL] --from <CODEX_HOME> <alias>
 ```
+
+Notes:
+
+- With `--proxy-url`, `--from` is resolved on the proxy host filesystem.
 
 ### `codexlb account list`
 
@@ -255,7 +261,7 @@ List enrolled accounts and health/state summary.
 Usage:
 
 ```bash
-codexlb account list [--root DIR]
+codexlb account list [--root DIR] [--proxy-url URL]
 ```
 
 ### `codexlb account rm`
@@ -265,7 +271,7 @@ Remove account and its stored account directory.
 Usage:
 
 ```bash
-codexlb account rm [--root DIR] <alias>
+codexlb account rm [--root DIR] [--proxy-url URL] <alias>
 ```
 
 ### `codexlb account pin`
@@ -275,7 +281,7 @@ Pin selection to a specific account alias.
 Usage:
 
 ```bash
-codexlb account pin [--root DIR] <alias>
+codexlb account pin [--root DIR] [--proxy-url URL] <alias>
 ```
 
 ### `codexlb account unpin`
@@ -285,8 +291,23 @@ Clear pinned account selection.
 Usage:
 
 ```bash
-codexlb account unpin [--root DIR]
+codexlb account unpin [--root DIR] [--proxy-url URL]
 ```
+
+### Proxy Admin API
+
+When `--proxy-url` is used for account commands, `codexlb` calls these proxy endpoints:
+
+- `GET /admin/accounts`
+- `POST /admin/account/login`
+- `POST /admin/account/import`
+- `POST /admin/account/rm`
+- `POST /admin/account/pin`
+- `POST /admin/account/unpin`
+
+Security note:
+
+- Admin API is currently unauthenticated; expose it only on trusted networks (or behind your own auth/TLS layer).
 
 ### `codexlb run`
 
@@ -303,7 +324,7 @@ Flags:
 | Flag | Description |
 |---|---|
 | `--root` | State directory |
-| `--proxy-url` | Override proxy URL (default `run.proxy_url`, else `http://<listen-from-store>`) |
+| `--proxy-url` | Override proxy URL (default `proxy.proxy_url`, else `http://<listen-from-store>`) |
 | `--codex-bin` | Codex executable path |
 | `--codex-home` | Wrapper runtime `CODEX_HOME` |
 | `--command` | Print wrapped command and exit (do not execute) |
@@ -314,7 +335,7 @@ Runtime env behavior:
 - Sets `OPENAI_API_KEY=codex-lb-local-key` if missing
 - Uses `CODEX_HOME` from `--codex-home` or `~/.codex-lb/runtime`
 - Runs through `$SHELL -lc` when `run.inherit_shell = true` (default)
-- If runtime `auth.json` is missing, seeds it from an enrolled account
+- If runtime `auth.json` is missing/invalid, seeds from an enrolled account when available; otherwise writes a local proxy-only stub auth
 - Prepends `commands.run` to passed args
 
 Examples:
@@ -342,7 +363,7 @@ Flags:
 | Flag | Description |
 |---|---|
 | `--root` | State directory (for default proxy URL resolution) |
-| `--proxy-url` | Explicit proxy URL (default `run.proxy_url`, else `http://<listen-from-store>`) |
+| `--proxy-url` | Explicit proxy URL (default `proxy.proxy_url`, else `http://<listen-from-store>`) |
 | `--timeout` | HTTP timeout (default `3s`) |
 | `--short` | One-line output for status bars |
 | `--json` | Raw JSON output |

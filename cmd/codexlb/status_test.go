@@ -120,7 +120,7 @@ func TestStatusCommandDefaultsToRunProxyURL(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	cfg := store.Snapshot().Settings
-	cfg.Run.ProxyURL = server.URL
+	cfg.ProxyURL = server.URL
 	cfg.Proxy.Listen = "127.0.0.1:1"
 	if err := lb.WriteSettingsConfig(root, cfg); err != nil {
 		t.Fatalf("write settings config: %v", err)

@@ -20,6 +20,7 @@ type configFile struct {
 type configProxy struct {
 	Listen                 string `toml:"listen"`
 	UpstreamBaseURL        string `toml:"upstream_base_url"`
+	ProxyURL               string `toml:"proxy_url"`
 	MaxAttempts            int    `toml:"max_attempts"`
 	UsageTimeoutMS         int    `toml:"usage_timeout_ms"`
 	CooldownDefaultSeconds int    `toml:"cooldown_default_seconds"`
@@ -48,8 +49,7 @@ type configCommands struct {
 }
 
 type configRun struct {
-	ProxyURL     string `toml:"proxy_url"`
-	InheritShell bool   `toml:"inherit_shell"`
+	InheritShell bool `toml:"inherit_shell"`
 }
 
 type partialConfigFile struct {
@@ -63,6 +63,7 @@ type partialConfigFile struct {
 type partialConfigProxy struct {
 	Listen                 *string `toml:"listen"`
 	UpstreamBaseURL        *string `toml:"upstream_base_url"`
+	ProxyURL               *string `toml:"proxy_url"`
 	MaxAttempts            *int    `toml:"max_attempts"`
 	UsageTimeoutMS         *int    `toml:"usage_timeout_ms"`
 	CooldownDefaultSeconds *int    `toml:"cooldown_default_seconds"`
@@ -91,8 +92,7 @@ type partialConfigCommands struct {
 }
 
 type partialConfigRun struct {
-	ProxyURL     *string `toml:"proxy_url"`
-	InheritShell *bool   `toml:"inherit_shell"`
+	InheritShell *bool `toml:"inherit_shell"`
 }
 
 func ConfigPath(root string) string {
@@ -125,6 +125,9 @@ func loadOrCreateSettingsConfig(root string) (Settings, error) {
 		}
 		if partial.Proxy.UpstreamBaseURL != nil {
 			out.Proxy.UpstreamBaseURL = strings.TrimRight(strings.TrimSpace(*partial.Proxy.UpstreamBaseURL), "/")
+		}
+		if partial.Proxy.ProxyURL != nil {
+			out.ProxyURL = strings.TrimSpace(*partial.Proxy.ProxyURL)
 		}
 		if partial.Proxy.MaxAttempts != nil {
 			out.Proxy.MaxAttempts = *partial.Proxy.MaxAttempts
@@ -175,12 +178,19 @@ func loadOrCreateSettingsConfig(root string) (Settings, error) {
 		}
 	}
 	if partial.Run != nil {
-		if partial.Run.ProxyURL != nil {
-			out.Run.ProxyURL = strings.TrimSpace(*partial.Run.ProxyURL)
-		}
 		if partial.Run.InheritShell != nil {
 			out.Run.InheritShell = *partial.Run.InheritShell
 		}
+	}
+	// Backward compatibility with older config.toml values under [run].
+	var legacy struct {
+		Run struct {
+			ProxyURL *string `toml:"proxy_url"`
+		} `toml:"run"`
+	}
+	loadedNewProxyURL := partial.Proxy != nil && partial.Proxy.ProxyURL != nil
+	if err := toml.Unmarshal(bytes, &legacy); err == nil && !loadedNewProxyURL && legacy.Run.ProxyURL != nil {
+		out.ProxyURL = strings.TrimSpace(*legacy.Run.ProxyURL)
 	}
 
 	// Keep merged settings normalized with defaults/ranges.
@@ -211,6 +221,7 @@ func settingsToConfig(settings Settings) configFile {
 		Proxy: configProxy{
 			Listen:                 settings.Proxy.Listen,
 			UpstreamBaseURL:        settings.Proxy.UpstreamBaseURL,
+			ProxyURL:               settings.ProxyURL,
 			MaxAttempts:            settings.Proxy.MaxAttempts,
 			UsageTimeoutMS:         settings.Proxy.UsageTimeoutMS,
 			CooldownDefaultSeconds: settings.Proxy.CooldownDefaultS,
@@ -233,7 +244,6 @@ func settingsToConfig(settings Settings) configFile {
 			Run:   append([]string(nil), settings.Commands.Run...),
 		},
 		Run: configRun{
-			ProxyURL:     settings.Run.ProxyURL,
 			InheritShell: settings.Run.InheritShell,
 		},
 	}
