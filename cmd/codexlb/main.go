@@ -355,12 +355,14 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	if resp, err := tryRemoteLoginWithFallback(store, alias, *codexBin, loginArgs); err == nil {
-		fmt.Printf("registered account %s (total=%d)\n", alias, resp.Total)
-		return 0
-	} else if !isRemoteAdminUnavailable(err) {
-		fmt.Fprintf(os.Stderr, "login account (remote): %v\n", err)
-		return 1
+	if shouldAutoRemoteAccount(store, *root) {
+		if resp, err := tryRemoteLoginWithFallback(store, alias, *codexBin, loginArgs); err == nil {
+			fmt.Printf("registered account %s (total=%d)\n", alias, resp.Total)
+			return 0
+		} else if !isRemoteAdminUnavailable(err) {
+			fmt.Fprintf(os.Stderr, "login account (remote): %v\n", err)
+			return 1
+		}
 	}
 	if err := lb.LoginAccount(store, alias, *codexBin, loginArgs); err != nil {
 		fmt.Fprintf(os.Stderr, "login account: %v\n", err)
@@ -409,12 +411,14 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	if resp, err := tryRemoteImportWithFallback(store, alias, *from); err == nil {
-		fmt.Printf("imported account %s (total=%d)\n", alias, resp.Total)
-		return 0
-	} else if !isRemoteAdminUnavailable(err) {
-		fmt.Fprintf(os.Stderr, "import account (remote): %v\n", err)
-		return 1
+	if shouldAutoRemoteAccount(store, *root) {
+		if resp, err := tryRemoteImportWithFallback(store, alias, *from); err == nil {
+			fmt.Printf("imported account %s (total=%d)\n", alias, resp.Total)
+			return 0
+		} else if !isRemoteAdminUnavailable(err) {
+			fmt.Fprintf(os.Stderr, "import account (remote): %v\n", err)
+			return 1
+		}
 	}
 	if err := lb.ImportAccount(store, alias, *from); err != nil {
 		fmt.Fprintf(os.Stderr, "import account: %v\n", err)
@@ -455,12 +459,14 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	if accounts, err := tryRemoteListWithFallback(store); err == nil {
-		printAccountList(accounts)
-		return 0
-	} else if !isRemoteAdminUnavailable(err) {
-		fmt.Fprintf(os.Stderr, "list accounts (remote): %v\n", err)
-		return 1
+	if shouldAutoRemoteAccount(store, *root) {
+		if accounts, err := tryRemoteListWithFallback(store); err == nil {
+			printAccountList(accounts)
+			return 0
+		} else if !isRemoteAdminUnavailable(err) {
+			fmt.Fprintf(os.Stderr, "list accounts (remote): %v\n", err)
+			return 1
+		}
 	}
 	printAccountList(lb.ListAccounts(store))
 	return 0
@@ -500,12 +506,14 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	if _, err := tryRemoteRemoveWithFallback(store, args[0]); err == nil {
-		fmt.Printf("removed account %s\n", args[0])
-		return 0
-	} else if !isRemoteAdminUnavailable(err) {
-		fmt.Fprintf(os.Stderr, "remove account (remote): %v\n", err)
-		return 1
+	if shouldAutoRemoteAccount(store, *root) {
+		if _, err := tryRemoteRemoveWithFallback(store, args[0]); err == nil {
+			fmt.Printf("removed account %s\n", args[0])
+			return 0
+		} else if !isRemoteAdminUnavailable(err) {
+			fmt.Fprintf(os.Stderr, "remove account (remote): %v\n", err)
+			return 1
+		}
 	}
 	if err := lb.RemoveAccount(store, args[0]); err != nil {
 		fmt.Fprintf(os.Stderr, "remove account: %v\n", err)
@@ -551,12 +559,14 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	if err := tryRemotePinWithFallback(store, alias); err == nil {
-		fmt.Printf("pinned account %s\n", alias)
-		return 0
-	} else if !isRemoteAdminUnavailable(err) {
-		fmt.Fprintf(os.Stderr, "pin account (remote): %v\n", err)
-		return 1
+	if shouldAutoRemoteAccount(store, *root) {
+		if err := tryRemotePinWithFallback(store, alias); err == nil {
+			fmt.Printf("pinned account %s\n", alias)
+			return 0
+		} else if !isRemoteAdminUnavailable(err) {
+			fmt.Fprintf(os.Stderr, "pin account (remote): %v\n", err)
+			return 1
+		}
 	}
 	snapshot := store.Snapshot()
 	pinnedID := ""
@@ -615,12 +625,14 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	if err := tryRemoteUnpinWithFallback(store); err == nil {
-		fmt.Println("unpinned account selection")
-		return 0
-	} else if !isRemoteAdminUnavailable(err) {
-		fmt.Fprintf(os.Stderr, "unpin account (remote): %v\n", err)
-		return 1
+	if shouldAutoRemoteAccount(store, *root) {
+		if err := tryRemoteUnpinWithFallback(store); err == nil {
+			fmt.Println("unpinned account selection")
+			return 0
+		} else if !isRemoteAdminUnavailable(err) {
+			fmt.Fprintf(os.Stderr, "unpin account (remote): %v\n", err)
+			return 1
+		}
 	}
 	if err := store.Update(func(sf *lb.StoreFile) error {
 		sf.State.PinnedAccountID = ""
@@ -663,6 +675,14 @@ func tryRemoteRemoveWithFallback(store *lb.Store, alias string) (lb.AdminMutatio
 
 func remoteAdminFallbackClient() *http.Client {
 	return &http.Client{Timeout: 750 * time.Millisecond}
+}
+
+func shouldAutoRemoteAccount(store *lb.Store, rootArg string) bool {
+	if strings.TrimSpace(rootArg) == "" {
+		return true
+	}
+	snapshot := store.Snapshot()
+	return strings.TrimSpace(snapshot.Settings.ProxyURL) != ""
 }
 
 func isRemoteAdminUnavailable(err error) bool {

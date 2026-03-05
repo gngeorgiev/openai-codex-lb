@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 var aliasRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
@@ -193,27 +194,13 @@ func resolveCodexInvocation(store *Store, codexBin, proxyURL, codexHome string, 
 
 func seedRuntimeAuthIfMissing(store *Store, codexHome string) error {
 	targetAuth := filepath.Join(codexHome, "auth.json")
-	if _, err := os.Stat(targetAuth); err == nil {
-		// Keep existing runtime auth when parseable; otherwise refresh below.
-		if _, loadErr := LoadAuth(codexHome); loadErr == nil {
-			return nil
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(targetAuth); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat runtime auth.json: %w", err)
 	}
 
 	snapshot := store.Snapshot()
 	if len(snapshot.Accounts) > 0 {
-		candidates := make([]int, 0, len(snapshot.Accounts))
-		if snapshot.State.ActiveIndex >= 0 && snapshot.State.ActiveIndex < len(snapshot.Accounts) {
-			candidates = append(candidates, snapshot.State.ActiveIndex)
-		}
-		for i := range snapshot.Accounts {
-			if i == snapshot.State.ActiveIndex {
-				continue
-			}
-			candidates = append(candidates, i)
-		}
+		candidates := runtimeAuthCandidateIndexes(snapshot, time.Now().UnixMilli())
 
 		for _, idx := range candidates {
 			home := snapshot.Accounts[idx].HomeDir
@@ -237,6 +224,30 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome string) error {
 		return fmt.Errorf("write proxy-only runtime auth.json: %w", err)
 	}
 	return nil
+}
+
+func runtimeAuthCandidateIndexes(snapshot StoreFile, nowMS int64) []int {
+	candidates := make([]int, 0, len(snapshot.Accounts))
+	seen := make(map[int]struct{}, len(snapshot.Accounts))
+	appendUnique := func(idx int) {
+		if idx < 0 || idx >= len(snapshot.Accounts) {
+			return
+		}
+		if _, ok := seen[idx]; ok {
+			return
+		}
+		seen[idx] = struct{}{}
+		candidates = append(candidates, idx)
+	}
+
+	if sel, err := selectAccount(&snapshot, nowMS); err == nil {
+		appendUnique(sel.Index)
+	}
+	appendUnique(snapshot.State.ActiveIndex)
+	for i := range snapshot.Accounts {
+		appendUnique(i)
+	}
+	return candidates
 }
 
 func writeProxyOnlyRuntimeAuth(path string) error {

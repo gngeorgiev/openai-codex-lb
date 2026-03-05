@@ -1,6 +1,7 @@
 package lb
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -98,5 +99,77 @@ func TestSeedRuntimeAuthIfMissingRepairsInvalidRuntimeAuth(t *testing.T) {
 	}
 	if auth.AccessToken == "" {
 		t.Fatalf("expected repaired runtime access token")
+	}
+}
+
+func TestSeedRuntimeAuthIfMissingRefreshesExistingRuntimeAuthFromSelectedAccount(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	homeA := filepath.Join(root, "acc-a")
+	homeB := filepath.Join(root, "acc-b")
+	if err := os.MkdirAll(homeA, 0o700); err != nil {
+		t.Fatalf("mkdir homeA: %v", err)
+	}
+	if err := os.MkdirAll(homeB, 0o700); err != nil {
+		t.Fatalf("mkdir homeB: %v", err)
+	}
+	writeAuthForTest(t, homeA, "acct-a", "a@example.com")
+	writeAuthForTest(t, homeB, "acct-b", "b@example.com")
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Accounts = []Account{
+			{Alias: "a", ID: "openai:a", HomeDir: homeA, Enabled: true},
+			{Alias: "b", ID: "openai:b", HomeDir: homeB, Enabled: true},
+		}
+		sf.State.ActiveIndex = 0
+		sf.State.PinnedAccountID = "openai:b"
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	runtimeHome := filepath.Join(root, "runtime-refresh")
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatalf("mkdir runtime home: %v", err)
+	}
+	writeAuthForTest(t, runtimeHome, "acct-a", "a@example.com")
+
+	if err := seedRuntimeAuthIfMissing(store, runtimeHome); err != nil {
+		t.Fatalf("seedRuntimeAuthIfMissing: %v", err)
+	}
+	auth, err := LoadAuth(runtimeHome)
+	if err != nil {
+		t.Fatalf("LoadAuth(runtime): %v", err)
+	}
+	if auth.ChatGPTAccountID != "acct-b" {
+		t.Fatalf("expected refreshed runtime account acct-b, got %q", auth.ChatGPTAccountID)
+	}
+}
+
+func writeAuthForTest(t *testing.T, home, accountID, email string) {
+	t.Helper()
+	token := testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": accountID,
+		},
+		"https://api.openai.com/profile": map[string]any{
+			"email": email,
+		},
+	})
+	payload := map[string]any{
+		"tokens": map[string]any{
+			"access_token": token,
+			"account_id":   accountID,
+		},
+	}
+	b, _ := json.Marshal(payload)
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); err != nil {
+		t.Fatalf("write auth.json for %s: %v", home, err)
 	}
 }
