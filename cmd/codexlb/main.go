@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -353,6 +355,13 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
+	if resp, err := tryRemoteLoginWithFallback(store, alias, *codexBin, loginArgs); err == nil {
+		fmt.Printf("registered account %s (total=%d)\n", alias, resp.Total)
+		return 0
+	} else if !isRemoteAdminUnavailable(err) {
+		fmt.Fprintf(os.Stderr, "login account (remote): %v\n", err)
+		return 1
+	}
 	if err := lb.LoginAccount(store, alias, *codexBin, loginArgs); err != nil {
 		fmt.Fprintf(os.Stderr, "login account: %v\n", err)
 		return 1
@@ -400,6 +409,13 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
+	if resp, err := tryRemoteImportWithFallback(store, alias, *from); err == nil {
+		fmt.Printf("imported account %s (total=%d)\n", alias, resp.Total)
+		return 0
+	} else if !isRemoteAdminUnavailable(err) {
+		fmt.Fprintf(os.Stderr, "import account (remote): %v\n", err)
+		return 1
+	}
 	if err := lb.ImportAccount(store, alias, *from); err != nil {
 		fmt.Fprintf(os.Stderr, "import account: %v\n", err)
 		return 1
@@ -439,6 +455,13 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
+	if accounts, err := tryRemoteListWithFallback(store); err == nil {
+		printAccountList(accounts)
+		return 0
+	} else if !isRemoteAdminUnavailable(err) {
+		fmt.Fprintf(os.Stderr, "list accounts (remote): %v\n", err)
+		return 1
+	}
 	printAccountList(lb.ListAccounts(store))
 	return 0
 }
@@ -475,6 +498,13 @@ Flags:
 	store, err := lb.OpenStore(*root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		return 1
+	}
+	if _, err := tryRemoteRemoveWithFallback(store, args[0]); err == nil {
+		fmt.Printf("removed account %s\n", args[0])
+		return 0
+	} else if !isRemoteAdminUnavailable(err) {
+		fmt.Fprintf(os.Stderr, "remove account (remote): %v\n", err)
 		return 1
 	}
 	if err := lb.RemoveAccount(store, args[0]); err != nil {
@@ -519,6 +549,13 @@ Flags:
 	store, err := lb.OpenStore(*root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		return 1
+	}
+	if err := tryRemotePinWithFallback(store, alias); err == nil {
+		fmt.Printf("pinned account %s\n", alias)
+		return 0
+	} else if !isRemoteAdminUnavailable(err) {
+		fmt.Fprintf(os.Stderr, "pin account (remote): %v\n", err)
 		return 1
 	}
 	snapshot := store.Snapshot()
@@ -578,6 +615,13 @@ Flags:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
+	if err := tryRemoteUnpinWithFallback(store); err == nil {
+		fmt.Println("unpinned account selection")
+		return 0
+	} else if !isRemoteAdminUnavailable(err) {
+		fmt.Fprintf(os.Stderr, "unpin account (remote): %v\n", err)
+		return 1
+	}
 	if err := store.Update(func(sf *lb.StoreFile) error {
 		sf.State.PinnedAccountID = ""
 		return nil
@@ -587,6 +631,51 @@ Flags:
 	}
 	fmt.Println("unpinned account selection")
 	return 0
+}
+
+func tryRemotePinWithFallback(store *lb.Store, alias string) error {
+	client := remoteAdminFallbackClient()
+	_, err := remoteAdminPinWithClient(client, resolveProxyURL(store, ""), alias)
+	return err
+}
+
+func tryRemoteUnpinWithFallback(store *lb.Store) error {
+	client := remoteAdminFallbackClient()
+	_, err := remoteAdminUnpinWithClient(client, resolveProxyURL(store, ""))
+	return err
+}
+
+func tryRemoteLoginWithFallback(store *lb.Store, alias, codexBin string, loginArgs []string) (lb.AdminMutationResponse, error) {
+	return remoteAdminLoginWithClient(remoteAdminFallbackClient(), resolveProxyURL(store, ""), alias, codexBin, loginArgs)
+}
+
+func tryRemoteImportWithFallback(store *lb.Store, alias, from string) (lb.AdminMutationResponse, error) {
+	return remoteAdminImportWithClient(remoteAdminFallbackClient(), resolveProxyURL(store, ""), alias, from)
+}
+
+func tryRemoteListWithFallback(store *lb.Store) ([]lb.Account, error) {
+	return remoteAdminListAccountsWithClient(remoteAdminFallbackClient(), resolveProxyURL(store, ""))
+}
+
+func tryRemoteRemoveWithFallback(store *lb.Store, alias string) (lb.AdminMutationResponse, error) {
+	return remoteAdminRemoveWithClient(remoteAdminFallbackClient(), resolveProxyURL(store, ""), alias)
+}
+
+func remoteAdminFallbackClient() *http.Client {
+	return &http.Client{Timeout: 750 * time.Millisecond}
+}
+
+func isRemoteAdminUnavailable(err error) bool {
+	var urlErr *neturl.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var responseErr *remoteAdminUnexpectedResponseError
+	if errors.As(err, &responseErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func printAccountList(accounts []lb.Account) {
@@ -758,16 +847,18 @@ func printStatusShort(status lb.ProxyStatus) {
 }
 
 func printStatusTable(status lb.ProxyStatus) {
-	fmt.Printf("policy=%s selected=%s reason=%s generated_at=%s\n", status.Policy.Mode, noneIfEmpty(status.SelectedAccountID), noneIfEmpty(status.SelectionReason), status.GeneratedAt)
+	pinnedAlias := pinnedAliasForStatus(status)
+	fmt.Printf("policy=%s selected=%s pinned=%s reason=%s generated_at=%s\n", status.Policy.Mode, noneIfEmpty(status.SelectedAccountID), noneIfEmpty(pinnedAlias), noneIfEmpty(status.SelectionReason), status.GeneratedAt)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "ACTIVE\tPIN\tALIAS\tID\tEMAIL\tSTATUS\tDAILY_LEFT\tWEEKLY_LEFT\tSCORE\tLAST_SWITCH\tQUOTA")
+	pinnedID := strings.TrimSpace(status.State.PinnedAccountID)
 	for _, a := range status.Accounts {
 		active := ""
 		if a.Active {
 			active = "*"
 		}
 		pin := ""
-		if a.Pinned {
+		if a.Pinned || (pinnedID != "" && (a.ID == pinnedID || a.Alias == pinnedID)) {
 			pin = "P"
 		}
 		state := "ready"
@@ -806,6 +897,24 @@ func printStatusTable(status lb.ProxyStatus) {
 			active, pin, a.Alias, a.ID, email, state, daily, weekly, a.Score, lastSwitch, quota)
 	}
 	_ = w.Flush()
+}
+
+func pinnedAliasForStatus(status lb.ProxyStatus) string {
+	pinnedID := strings.TrimSpace(status.State.PinnedAccountID)
+	if pinnedID == "" {
+		for _, a := range status.Accounts {
+			if a.Pinned {
+				return a.Alias
+			}
+		}
+		return ""
+	}
+	for _, a := range status.Accounts {
+		if a.Alias == pinnedID || a.ID == pinnedID {
+			return a.Alias
+		}
+	}
+	return pinnedID
 }
 
 func noneIfEmpty(v string) string {

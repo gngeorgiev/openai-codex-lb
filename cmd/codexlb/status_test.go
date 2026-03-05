@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ func TestStatusCommandPrintsTable(t *testing.T) {
 		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
 		Policy:            lb.PolicyConfig{Mode: lb.PolicyUsageBalanced},
 		SelectedAccountID: "openai:alice",
+		State:             lb.RuntimeState{PinnedAccountID: "openai:alice"},
 		SelectionReason:   "usage-stay",
 		Accounts: []lb.AccountStatus{
 			{Alias: "alice", ID: "openai:alice", Email: "a@example.com", Active: true, Healthy: true, Enabled: true, DailyLeftPct: 80, WeeklyLeftPct: 70, Score: 0.75},
@@ -41,6 +43,12 @@ func TestStatusCommandPrintsTable(t *testing.T) {
 	}
 	if !strings.Contains(out, "policy=usage_balanced") {
 		t.Fatalf("expected policy line in output: %s", out)
+	}
+	if !strings.Contains(out, "pinned=alice") {
+		t.Fatalf("expected pinned alias in output: %s", out)
+	}
+	if !regexp.MustCompile(`(?m)^\*\s+P\s+alice\s+openai:alice`).MatchString(out) {
+		t.Fatalf("expected pinned marker in account row: %s", out)
 	}
 	if !strings.Contains(out, "alice") {
 		t.Fatalf("expected account row in output: %s", out)
