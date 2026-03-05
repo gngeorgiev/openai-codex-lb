@@ -1,6 +1,7 @@
 package lb
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,7 +12,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -85,6 +89,15 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(status)
+		p.logEvent("request.completed", map[string]any{
+			"req_id": reqID,
+			"status": http.StatusOK,
+			"path":   r.URL.Path,
+		})
+		return
+	}
+	if r.URL.Path == "/logs" {
+		p.handleLogs(w, r)
 		p.logEvent("request.completed", map[string]any{
 			"req_id": reqID,
 			"status": http.StatusOK,
@@ -506,6 +519,107 @@ func (p *ProxyServer) maybeRefreshQuota(ctx context.Context, now time.Time, forc
 			"last_sync_at_ms": updated.Quota.LastSyncAt,
 		})
 	}
+}
+
+func (p *ProxyServer) handleLogs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	offset := int64(-1)
+	if raw := strings.TrimSpace(q.Get("offset")); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+	tailN := 100
+	if raw := strings.TrimSpace(q.Get("tail")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			tailN = v
+		}
+	}
+	limit := 500
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			limit = min(2000, v)
+		}
+	}
+
+	logPath := filepath.Join(p.store.RootDir(), "logs", "proxy.current.jsonl")
+	info, err := os.Stat(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.Header().Set("X-Next-Offset", "0")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if offset >= 0 {
+		if offset > info.Size() {
+			offset = info.Size()
+		}
+		file, err := os.Open(logPath)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		nextOffset := offset
+		lines := 0
+		var b strings.Builder
+		for scanner.Scan() {
+			line := scanner.Text()
+			b.WriteString(line)
+			b.WriteByte('\n')
+			nextOffset += int64(len(line) + 1)
+			lines++
+			if lines >= limit {
+				break
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("X-Next-Offset", strconv.FormatInt(nextOffset, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, b.String())
+		return
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	text := strings.TrimRight(string(data), "\n")
+	if text == "" {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("X-Next-Offset", strconv.FormatInt(info.Size(), 10))
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	lines := strings.Split(text, "\n")
+	if tailN > len(lines) {
+		tailN = len(lines)
+	}
+	if tailN > limit {
+		tailN = limit
+	}
+	selected := strings.Join(lines[len(lines)-tailN:], "\n") + "\n"
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("X-Next-Offset", strconv.FormatInt(info.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, selected)
 }
 
 func readBodySnippet(r io.Reader, maxBytes int) string {

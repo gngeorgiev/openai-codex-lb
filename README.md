@@ -182,6 +182,12 @@ Usage:
 codexlb proxy [flags]
 ```
 
+To fetch logs from a running proxy instance:
+
+```bash
+codexlb proxy logs [flags]
+```
+
 Key flags:
 
 | Flag | Description |
@@ -202,6 +208,21 @@ Examples:
 codexlb proxy
 codexlb proxy --listen 127.0.0.1:9000 --upstream https://chatgpt.com/backend-api
 ```
+
+### `codexlb proxy logs`
+
+Fetch or tail proxy event logs over HTTP from a running proxy.
+
+Usage:
+
+```bash
+codexlb proxy logs [--root DIR] [--proxy-url URL] [--tail 100] [--offset N] [--limit 500] [--follow] [--interval 2s]
+```
+
+Notes:
+
+- Use `--proxy-url` for remote instances.
+- `--follow` polls `/logs` with byte offsets and prints only new lines.
 
 ### `codexlb account login`
 

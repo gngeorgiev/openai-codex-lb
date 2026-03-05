@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -48,6 +49,21 @@ func run(argv []string) int {
 }
 
 func runProxy(argv []string) int {
+	if len(argv) > 0 {
+		switch argv[0] {
+		case "logs":
+			return runProxyLogs(argv[1:])
+		case "help", "-h", "--help":
+			fmt.Print(`Usage: codexlb proxy [flags]
+       codexlb proxy logs [flags]
+
+Subcommands:
+  logs    Fetch/tail proxy event logs over HTTP
+`)
+			return 0
+		}
+	}
+
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
 	root := fs.String("root", "", "State directory (default: ~/.codex-lb)")
 	listen := fs.String("listen", "", "Listen address, e.g. 127.0.0.1:8765")
@@ -160,6 +176,110 @@ Examples:
 		events.Log("proxy.error", map[string]any{"error": err.Error()})
 		fmt.Fprintf(os.Stderr, "proxy server error: %v\n", err)
 		return 1
+	}
+}
+
+func runProxyLogs(argv []string) int {
+	fs := flag.NewFlagSet("proxy logs", flag.ContinueOnError)
+	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: run.proxy_url or http://<listen-from-store>)")
+	tail := fs.Int("tail", 100, "Number of most recent log lines for initial fetch")
+	offset := fs.Int64("offset", -1, "Start reading from byte offset (overrides --tail)")
+	limit := fs.Int("limit", 500, "Maximum lines per request")
+	follow := fs.Bool("follow", false, "Poll continuously for new log lines")
+	interval := fs.Duration("interval", 2*time.Second, "Polling interval for --follow")
+	timeout := fs.Duration("timeout", 10*time.Second, "HTTP timeout for log requests")
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), `Usage: codexlb proxy logs [flags]
+
+Fetch or tail proxy event logs from a running proxy instance.
+
+Flags:
+`)
+		fs.PrintDefaults()
+		fmt.Fprint(fs.Output(), `
+Examples:
+  codexlb proxy logs
+  codexlb proxy logs --proxy-url http://10.0.0.25:8765 --tail 200
+  codexlb proxy logs --proxy-url https://proxy.example.com --follow
+`)
+	}
+	if err := fs.Parse(argv); err != nil {
+		return parseFlagError(err)
+	}
+
+	store, err := lb.OpenStore(*root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		return 1
+	}
+	baseURL := resolveProxyURL(store, *proxyURL)
+	logURL := strings.TrimRight(baseURL, "/") + "/logs"
+	client := &http.Client{Timeout: *timeout}
+
+	curOffset := *offset
+	if curOffset < 0 && *tail <= 0 {
+		curOffset = 0
+	}
+
+	fetchOnce := func() (int64, int) {
+		reqURL := logURL
+		params := []string{}
+		if curOffset >= 0 {
+			params = append(params, fmt.Sprintf("offset=%d", curOffset))
+		} else {
+			params = append(params, fmt.Sprintf("tail=%d", *tail))
+		}
+		params = append(params, fmt.Sprintf("limit=%d", *limit))
+		if len(params) > 0 {
+			reqURL += "?" + strings.Join(params, "&")
+		}
+		resp, err := client.Get(reqURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "query proxy logs %s: %v\n", reqURL, err)
+			return curOffset, 1
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "read proxy logs response: %v\n", err)
+			return curOffset, 1
+		}
+		if resp.StatusCode != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "proxy logs error: status=%d body=%s\n", resp.StatusCode, strings.TrimSpace(string(body)))
+			return curOffset, 1
+		}
+		if len(body) > 0 {
+			_, _ = os.Stdout.Write(body)
+			if body[len(body)-1] != '\n' {
+				fmt.Println()
+			}
+		}
+		next := curOffset
+		if raw := strings.TrimSpace(resp.Header.Get("X-Next-Offset")); raw != "" {
+			if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 {
+				next = v
+			}
+		}
+		return next, 0
+	}
+
+	next, code := fetchOnce()
+	if code != 0 {
+		return code
+	}
+	curOffset = next
+	if !*follow {
+		return 0
+	}
+
+	for {
+		time.Sleep(*interval)
+		next, code = fetchOnce()
+		if code != 0 {
+			return code
+		}
+		curOffset = next
 	}
 }
 
@@ -511,15 +631,7 @@ Examples:
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	snapshot := store.Snapshot()
-	url := *proxyURL
-	if strings.TrimSpace(url) == "" {
-		if snapshot.Settings.Run.ProxyURL != "" {
-			url = snapshot.Settings.Run.ProxyURL
-		} else {
-			url = "http://" + snapshot.Settings.Proxy.Listen
-		}
-	}
+	url := resolveProxyURL(store, *proxyURL)
 	url = strings.TrimRight(url, "/") + "/status"
 
 	client := &http.Client{Timeout: *timeout}
@@ -558,6 +670,18 @@ Examples:
 	}
 	printStatusTable(status)
 	return 0
+}
+
+func resolveProxyURL(store *lb.Store, proxyURL string) string {
+	url := strings.TrimSpace(proxyURL)
+	if url != "" {
+		return url
+	}
+	snapshot := store.Snapshot()
+	if snapshot.Settings.Run.ProxyURL != "" {
+		return snapshot.Settings.Run.ProxyURL
+	}
+	return "http://" + snapshot.Settings.Proxy.Listen
 }
 
 func printStatusShort(status lb.ProxyStatus) {
@@ -660,7 +784,7 @@ Usage:
   codexlb <command> [flags]
 
 Commands:
-  proxy    Run the local load-balancing proxy
+  proxy    Run proxy server (or use 'proxy logs')
   account  Manage enrolled accounts (login/import/list/rm/pin/unpin)
   status   Show runtime status table from running proxy
   run      Run codex with proxy endpoint environment wiring
