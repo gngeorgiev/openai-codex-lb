@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gngeorgiev/openai-codex-lb/internal/lb"
 )
 
 func TestE2EWrapperLoginAndRun(t *testing.T) {
@@ -125,11 +127,97 @@ func TestRunCommandOnlyPrintsWrappedCommand(t *testing.T) {
 	}
 }
 
+func TestE2EConfiguredLoginCommand(t *testing.T) {
+	root := t.TempDir()
+	fakeLog := filepath.Join(root, "fake-codex.log")
+	fakeBin := filepath.Join(root, "codex")
+	writeFakeCodex(t, fakeBin)
+
+	t.Setenv("CODEXLB_CODEX_BIN", fakeBin)
+	t.Setenv("FAKE_LOG", fakeLog)
+	t.Setenv("FAKE_TOKEN", testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	}))
+	t.Setenv("FAKE_ACCOUNT_ID", "acct-a")
+
+	store, err := lb.OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Update(func(sf *lb.StoreFile) error {
+		sf.Settings.Commands.Login = []string{"login", "--yolo"}
+		return nil
+	}); err != nil {
+		t.Fatalf("update store: %v", err)
+	}
+	if err := store.PersistSettingsToConfig(); err != nil {
+		t.Fatalf("persist config: %v", err)
+	}
+
+	if code := run([]string{"account", "login", "--root", root, "alice"}); code != 0 {
+		t.Fatalf("account login failed: %d", code)
+	}
+
+	data, err := os.ReadFile(fakeLog)
+	if err != nil {
+		t.Fatalf("read fake log: %v", err)
+	}
+	if !strings.Contains(string(data), "LOGIN_ARGS=login --yolo") {
+		t.Fatalf("expected configured login command in log, got: %s", string(data))
+	}
+}
+
+func TestE2EConfiguredRunCommandPrefix(t *testing.T) {
+	root := t.TempDir()
+	fakeLog := filepath.Join(root, "fake-codex.log")
+	fakeBin := filepath.Join(root, "codex")
+	writeFakeCodex(t, fakeBin)
+
+	t.Setenv("CODEXLB_CODEX_BIN", fakeBin)
+	t.Setenv("FAKE_LOG", fakeLog)
+	t.Setenv("FAKE_TOKEN", testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	}))
+	t.Setenv("FAKE_ACCOUNT_ID", "acct-a")
+
+	if code := run([]string{"account", "login", "--root", root, "alice"}); code != 0 {
+		t.Fatalf("account login failed: %d", code)
+	}
+
+	store, err := lb.OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.Update(func(sf *lb.StoreFile) error {
+		sf.Settings.Commands.Run = []string{"exec", "--yolo"}
+		return nil
+	}); err != nil {
+		t.Fatalf("update store: %v", err)
+	}
+	if err := store.PersistSettingsToConfig(); err != nil {
+		t.Fatalf("persist config: %v", err)
+	}
+
+	runtimeHome := filepath.Join(root, "runtime-home")
+	if code := run([]string{"run", "--root", root, "--proxy-url", "http://127.0.0.1:9876", "--codex-home", runtimeHome, "--", "--json", "ping"}); code != 0 {
+		t.Fatalf("wrapper run failed: %d", code)
+	}
+
+	data, err := os.ReadFile(fakeLog)
+	if err != nil {
+		t.Fatalf("read fake log: %v", err)
+	}
+	if !strings.Contains(string(data), "ARGS=exec --yolo --json ping") {
+		t.Fatalf("expected configured run command prefix in log, got: %s", string(data))
+	}
+}
+
 func writeFakeCodex(t *testing.T, path string) {
 	t.Helper()
 	script := `#!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "login" ]]; then
+  echo "LOGIN_ARGS=$*" >> "${FAKE_LOG:?missing FAKE_LOG}"
   mkdir -p "$CODEX_HOME"
   cat > "$CODEX_HOME/auth.json" <<JSON
 {"tokens":{"access_token":"${FAKE_TOKEN:?missing FAKE_TOKEN}","account_id":"${FAKE_ACCOUNT_ID:-}"}}

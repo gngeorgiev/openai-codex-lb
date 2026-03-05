@@ -131,7 +131,7 @@ func (s *Store) ReloadSettingsFromConfig() (SettingsReloadSummary, error) {
 	summary := SettingsReloadSummary{
 		Previous: prev,
 		Current:  settings,
-		Changed:  settings != prev,
+		Changed:  !settingsEqual(settings, prev),
 	}
 
 	// Listen address is bound by the running HTTP server and needs a restart.
@@ -178,7 +178,22 @@ func writeJSONAtomic(path string, v any) error {
 func cloneStore(in StoreFile) StoreFile {
 	out := in
 	out.Accounts = append([]Account(nil), in.Accounts...)
+	out.Settings.Commands.Login = append([]string(nil), in.Settings.Commands.Login...)
+	out.Settings.Commands.Run = append([]string(nil), in.Settings.Commands.Run...)
 	return out
+}
+
+func settingsEqual(a, b Settings) bool {
+	if a.Proxy != b.Proxy || a.Policy != b.Policy || a.Quota != b.Quota {
+		return false
+	}
+	if !slices.Equal(a.Commands.Login, b.Commands.Login) {
+		return false
+	}
+	if !slices.Equal(a.Commands.Run, b.Commands.Run) {
+		return false
+	}
+	return true
 }
 
 func (s *Store) UpsertAccount(account Account) error {

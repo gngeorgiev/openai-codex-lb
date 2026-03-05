@@ -28,6 +28,9 @@ func TestOpenStoreCreatesConfigToml(t *testing.T) {
 	if !strings.Contains(text, "upstream_base_url") {
 		t.Fatalf("expected upstream_base_url in config.toml: %s", text)
 	}
+	if !strings.Contains(text, "[commands]") {
+		t.Fatalf("expected [commands] section in config.toml: %s", text)
+	}
 }
 
 func TestOpenStoreLoadsConfigTomlValues(t *testing.T) {
@@ -55,6 +58,10 @@ weekly = 30
 refresh_interval_minutes = 3
 refresh_interval_messages = 2
 cache_ttl_minutes = 8
+
+[commands]
+login = ["login", "--device-code"]
+run = ["exec", "--yolo"]
 `
 	if err := os.WriteFile(filepath.Join(root, "config.toml"), []byte(custom), 0o600); err != nil {
 		t.Fatalf("write config.toml: %v", err)
@@ -76,5 +83,11 @@ cache_ttl_minutes = 8
 	}
 	if snap.Settings.Quota.RefreshIntervalMinutes != 3 {
 		t.Fatalf("quota refresh_interval_minutes not loaded: %d", snap.Settings.Quota.RefreshIntervalMinutes)
+	}
+	if len(snap.Settings.Commands.Login) != 2 || snap.Settings.Commands.Login[1] != "--device-code" {
+		t.Fatalf("commands.login not loaded: %#v", snap.Settings.Commands.Login)
+	}
+	if len(snap.Settings.Commands.Run) != 2 || snap.Settings.Commands.Run[1] != "--yolo" {
+		t.Fatalf("commands.run not loaded: %#v", snap.Settings.Commands.Run)
 	}
 }

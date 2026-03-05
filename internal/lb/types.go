@@ -1,6 +1,9 @@
 package lb
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type PolicyMode string
 
@@ -35,10 +38,16 @@ type QuotaConfig struct {
 	CacheTTLMinutes         int `json:"cache_ttl_minutes"`
 }
 
+type CommandConfig struct {
+	Login []string `json:"login"`
+	Run   []string `json:"run"`
+}
+
 type Settings struct {
-	Proxy  ProxyConfig  `json:"proxy"`
-	Policy PolicyConfig `json:"policy"`
-	Quota  QuotaConfig  `json:"quota"`
+	Proxy    ProxyConfig   `json:"proxy"`
+	Policy   PolicyConfig  `json:"policy"`
+	Quota    QuotaConfig   `json:"quota"`
+	Commands CommandConfig `json:"commands"`
 }
 
 type QuotaState struct {
@@ -108,6 +117,10 @@ func defaultStore() StoreFile {
 				RefreshIntervalMessages: 10,
 				CacheTTLMinutes:         30,
 			},
+			Commands: CommandConfig{
+				Login: []string{"login"},
+				Run:   []string{},
+			},
 		},
 		State:    RuntimeState{ActiveIndex: 0},
 		Accounts: []Account{},
@@ -165,6 +178,15 @@ func mergeDefaults(in StoreFile) StoreFile {
 	if out.Settings.Quota.CacheTTLMinutes <= 0 {
 		out.Settings.Quota.CacheTTLMinutes = def.Settings.Quota.CacheTTLMinutes
 	}
+	if len(out.Settings.Commands.Login) == 0 {
+		out.Settings.Commands.Login = append([]string(nil), def.Settings.Commands.Login...)
+	} else {
+		out.Settings.Commands.Login = sanitizeCommand(out.Settings.Commands.Login)
+		if len(out.Settings.Commands.Login) == 0 {
+			out.Settings.Commands.Login = append([]string(nil), def.Settings.Commands.Login...)
+		}
+	}
+	out.Settings.Commands.Run = sanitizeCommand(out.Settings.Commands.Run)
 
 	for i := range out.Accounts {
 		if out.Accounts[i].BaseURL == "" {
@@ -174,6 +196,18 @@ func mergeDefaults(in StoreFile) StoreFile {
 			// Keep disabled state if explicitly disabled in older versions.
 			out.Accounts[i].Enabled = true
 		}
+	}
+	return out
+}
+
+func sanitizeCommand(parts []string) []string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		out = append(out, part)
 	}
 	return out
 }

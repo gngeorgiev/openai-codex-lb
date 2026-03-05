@@ -10,9 +10,10 @@ import (
 )
 
 type configFile struct {
-	Proxy  configProxy  `toml:"proxy"`
-	Policy configPolicy `toml:"policy"`
-	Quota  configQuota  `toml:"quota"`
+	Proxy    configProxy    `toml:"proxy"`
+	Policy   configPolicy   `toml:"policy"`
+	Quota    configQuota    `toml:"quota"`
+	Commands configCommands `toml:"commands"`
 }
 
 type configProxy struct {
@@ -40,10 +41,16 @@ type configQuota struct {
 	CacheTTLMinutes         int `toml:"cache_ttl_minutes"`
 }
 
+type configCommands struct {
+	Login []string `toml:"login"`
+	Run   []string `toml:"run"`
+}
+
 type partialConfigFile struct {
-	Proxy  *partialConfigProxy  `toml:"proxy"`
-	Policy *partialConfigPolicy `toml:"policy"`
-	Quota  *partialConfigQuota  `toml:"quota"`
+	Proxy    *partialConfigProxy    `toml:"proxy"`
+	Policy   *partialConfigPolicy   `toml:"policy"`
+	Quota    *partialConfigQuota    `toml:"quota"`
+	Commands *partialConfigCommands `toml:"commands"`
 }
 
 type partialConfigProxy struct {
@@ -69,6 +76,11 @@ type partialConfigQuota struct {
 	RefreshIntervalMinutes  *int `toml:"refresh_interval_minutes"`
 	RefreshIntervalMessages *int `toml:"refresh_interval_messages"`
 	CacheTTLMinutes         *int `toml:"cache_ttl_minutes"`
+}
+
+type partialConfigCommands struct {
+	Login *[]string `toml:"login"`
+	Run   *[]string `toml:"run"`
 }
 
 func ConfigPath(root string) string {
@@ -141,6 +153,14 @@ func loadOrCreateSettingsConfig(root string, fallback Settings) (Settings, error
 			out.Quota.CacheTTLMinutes = *partial.Quota.CacheTTLMinutes
 		}
 	}
+	if partial.Commands != nil {
+		if partial.Commands.Login != nil {
+			out.Commands.Login = sanitizeCommand(*partial.Commands.Login)
+		}
+		if partial.Commands.Run != nil {
+			out.Commands.Run = sanitizeCommand(*partial.Commands.Run)
+		}
+	}
 
 	// Keep merged settings normalized with defaults/ranges.
 	tmp := defaultStore()
@@ -186,6 +206,10 @@ func settingsToConfig(settings Settings) configFile {
 			RefreshIntervalMinutes:  settings.Quota.RefreshIntervalMinutes,
 			RefreshIntervalMessages: settings.Quota.RefreshIntervalMessages,
 			CacheTTLMinutes:         settings.Quota.CacheTTLMinutes,
+		},
+		Commands: configCommands{
+			Login: append([]string(nil), settings.Commands.Login...),
+			Run:   append([]string(nil), settings.Commands.Run...),
 		},
 	}
 }

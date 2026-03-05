@@ -97,6 +97,13 @@ weekly = 40
 refresh_interval_minutes = 10
 refresh_interval_messages = 10
 cache_ttl_minutes = 30
+
+[commands]
+# Base command used by `codexlb account login` (CLI args are appended).
+login = ["login"]
+# Prefix inserted before args passed to `codexlb run`.
+# Example enables yolo by default:
+run = ["exec", "--yolo"]
 ```
 
 Notes:
@@ -206,6 +213,8 @@ Flags:
 - `--root` state directory
 - `--codex-bin` codex executable path
 
+`[commands.login]` values are prepended before any extra `<codex-login-args...>`.
+
 Usage:
 
 ```bash
@@ -267,6 +276,8 @@ Flags:
 - `--codex-bin` codex executable path
 - `--codex-home` runtime `CODEX_HOME` used for wrapped codex process
 - `--command` print wrapped command and exit without executing codex
+
+`[commands.run]` values are prepended before CLI args (useful for `--yolo`).
 
 Usage:
 

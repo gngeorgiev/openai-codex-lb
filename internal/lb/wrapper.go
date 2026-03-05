@@ -36,8 +36,12 @@ func LoginAccount(store *Store, alias, codexBin string, loginArgs []string) erro
 	if codexBin == "" {
 		codexBin = "codex"
 	}
-	args := []string{"login"}
-	args = append(args, loginArgs...)
+	snapshot := store.Snapshot()
+	baseLogin := sanitizeCommand(snapshot.Settings.Commands.Login)
+	if len(baseLogin) == 0 {
+		baseLogin = []string{"login"}
+	}
+	args := append(append([]string(nil), baseLogin...), loginArgs...)
 	cmd := exec.Command(codexBin, args...)
 	cmd.Env = withEnv(os.Environ(), map[string]string{"CODEX_HOME": home})
 	cmd.Stdin = os.Stdin
@@ -158,6 +162,10 @@ func resolveCodexInvocation(store *Store, codexBin, proxyURL, codexHome string, 
 	if codexHome == "" {
 		codexHome = store.RuntimeDir()
 	}
+	runPrefix := sanitizeCommand(snapshot.Settings.Commands.Run)
+	fullArgs := make([]string, 0, len(runPrefix)+len(args))
+	fullArgs = append(fullArgs, runPrefix...)
+	fullArgs = append(fullArgs, args...)
 
 	env := map[string]string{
 		"OPENAI_BASE_URL": proxyURL,
@@ -166,7 +174,7 @@ func resolveCodexInvocation(store *Store, codexBin, proxyURL, codexHome string, 
 	if os.Getenv("OPENAI_API_KEY") == "" {
 		env["OPENAI_API_KEY"] = "codex-lb-local-key"
 	}
-	return codexBin, append([]string(nil), args...), codexHome, env
+	return codexBin, fullArgs, codexHome, env
 }
 
 func seedRuntimeAuthIfMissing(store *Store, codexHome string) error {
