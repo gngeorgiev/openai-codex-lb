@@ -86,6 +86,10 @@ func TestSeedRuntimeAuthIfMissingCreatesProxyOnlyAuthWithoutAccounts(t *testing.
 	if idToken == "" {
 		t.Fatalf("expected proxy-only id_token in runtime auth")
 	}
+	refreshToken, _ := tokens["refresh_token"].(string)
+	if refreshToken == "" {
+		t.Fatalf("expected proxy-only refresh_token in runtime auth")
+	}
 }
 
 func TestSeedRuntimeAuthIfMissingRepairsInvalidRuntimeAuth(t *testing.T) {
@@ -198,8 +202,22 @@ func TestSeedRuntimeAuthIfMissingFetchesFromRemoteProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read runtime auth.json: %v", err)
 	}
-	if string(raw) != `{"tokens":{"access_token":"remote-access","id_token":"remote-id","account_id":"acct-remote"}}` {
-		t.Fatalf("unexpected runtime auth payload: %s", string(raw))
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal runtime auth payload: %v", err)
+	}
+	tokens, _ := payload["tokens"].(map[string]any)
+	if got, _ := tokens["access_token"].(string); got != "remote-access" {
+		t.Fatalf("unexpected access_token: %q", got)
+	}
+	if got, _ := tokens["id_token"].(string); got != "remote-id" {
+		t.Fatalf("unexpected id_token: %q", got)
+	}
+	if got, _ := tokens["account_id"].(string); got != "acct-remote" {
+		t.Fatalf("unexpected account_id: %q", got)
+	}
+	if got, _ := tokens["refresh_token"].(string); got != "remote-access" {
+		t.Fatalf("expected refresh_token to be derived from access_token, got %q", got)
 	}
 }
 

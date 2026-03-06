@@ -206,10 +206,15 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 		for _, idx := range candidates {
 			home := snapshot.Accounts[idx].HomeDir
 			sourceAuth := filepath.Join(home, "auth.json")
-			if _, err := os.Stat(sourceAuth); err != nil {
+			rawAuth, err := os.ReadFile(sourceAuth)
+			if err != nil {
 				continue
 			}
-			if err := copyFile(sourceAuth, targetAuth, 0o600); err != nil {
+			normalizedAuth, err := normalizeRuntimeAuthPayload(rawAuth, snapshot.Accounts[idx].ChatGPTAccountID)
+			if err != nil {
+				continue
+			}
+			if err := os.WriteFile(targetAuth, normalizedAuth, 0o600); err != nil {
 				return fmt.Errorf("seed runtime auth.json from account %s: %w", snapshot.Accounts[idx].Alias, err)
 			}
 			sourceConfig := filepath.Join(home, "config.toml")
@@ -222,7 +227,11 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 	}
 
 	if remoteAuth, err := fetchRemoteRuntimeAuth(proxyURL); err == nil {
-		if err := os.WriteFile(targetAuth, remoteAuth, 0o600); err != nil {
+		normalizedAuth, err := normalizeRuntimeAuthPayload(remoteAuth, "")
+		if err != nil {
+			return fmt.Errorf("normalize runtime auth from remote proxy: %w", err)
+		}
+		if err := os.WriteFile(targetAuth, normalizedAuth, 0o600); err != nil {
 			return fmt.Errorf("seed runtime auth.json from remote proxy: %w", err)
 		}
 		return nil
@@ -294,6 +303,7 @@ func writeProxyOnlyRuntimeAuth(path string) error {
 	payload := map[string]any{
 		"tokens": map[string]any{
 			"access_token": token,
+			"refresh_token": token,
 			"id_token":     token,
 			"account_id":   "proxy-only",
 		},
@@ -388,4 +398,42 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
 	}
 	return out.Close()
+}
+
+func normalizeRuntimeAuthPayload(raw []byte, fallbackAccountID string) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("parse runtime auth payload: %w", err)
+	}
+
+	tokens, _ := payload["tokens"].(map[string]any)
+	if tokens == nil {
+		return nil, fmt.Errorf("missing tokens object")
+	}
+
+	accessToken := strings.TrimSpace(stringField(tokens["access_token"]))
+	if accessToken == "" {
+		return nil, fmt.Errorf("missing tokens.access_token")
+	}
+	if strings.TrimSpace(stringField(tokens["refresh_token"])) == "" {
+		tokens["refresh_token"] = accessToken
+	}
+	if strings.TrimSpace(stringField(tokens["id_token"])) == "" {
+		tokens["id_token"] = accessToken
+	}
+	if strings.TrimSpace(stringField(tokens["account_id"])) == "" && strings.TrimSpace(fallbackAccountID) != "" {
+		tokens["account_id"] = fallbackAccountID
+	}
+	payload["tokens"] = tokens
+
+	normalized, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("serialize runtime auth payload: %w", err)
+	}
+	return normalized, nil
+}
+
+func stringField(v any) string {
+	s, _ := v.(string)
+	return s
 }
