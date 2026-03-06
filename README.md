@@ -68,6 +68,42 @@ make install PREFIX=$HOME/.local
 ./codexlb run exec --json "fix this"
 ```
 
+## Docker
+
+Build and run with Compose:
+
+```bash
+docker compose up -d --build
+```
+
+Stop:
+
+```bash
+docker compose down
+```
+
+Defaults:
+
+- Proxy listens on `0.0.0.0:8765` in container and is published as `127.0.0.1:8765` on host.
+- Host `~/.codex-lb` is bind-mounted to `/data` in container.
+- Container runs `codexlb proxy --root /data`.
+
+Mounted data under `/data` includes:
+
+- `store.json`
+- `config.toml`
+- `accounts/`
+- `runtime/`
+- `logs/`
+
+Optional environment overrides:
+
+- `CODEXLB_ROOT_DIR` (host path to mount instead of `~/.codex-lb`)
+- `CODEXLB_UPSTREAM`
+- `CODEXLB_BIND_HOST`
+- `CODEXLB_PORT`
+- `UID` / `GID` (container runtime user)
+
 ## Paths
 
 Default root is `~/.codex-lb`.
@@ -304,10 +340,12 @@ When `--proxy-url` is used for account commands, `codexlb` calls these proxy end
 - `POST /admin/account/rm`
 - `POST /admin/account/pin`
 - `POST /admin/account/unpin`
+- `GET /admin/runtime-auth`
 
 Security note:
 
 - Admin API is currently unauthenticated; expose it only on trusted networks (or behind your own auth/TLS layer).
+- `GET /admin/runtime-auth` returns the selected account's raw `auth.json` payload for runtime bootstrapping; treat it as highly sensitive credential material.
 
 ### `codexlb run`
 
@@ -335,7 +373,9 @@ Runtime env behavior:
 - Sets `OPENAI_API_KEY=codex-lb-local-key` if missing
 - Uses `CODEX_HOME` from `--codex-home` or `~/.codex-lb/runtime`
 - Runs through `$SHELL -lc` when `run.inherit_shell = true` (default)
-- If runtime `auth.json` is missing/invalid, seeds from an enrolled account when available; otherwise writes a local proxy-only stub auth
+- If runtime `auth.json` is missing/invalid, seeds from an enrolled account when available
+- If no local accounts are enrolled, attempts to fetch runtime auth from remote proxy `GET /admin/runtime-auth`
+- If remote auth is unavailable, writes a local proxy-only stub auth (includes both `access_token` and `id_token`)
 - Prepends `commands.run` to passed args
 
 Examples:

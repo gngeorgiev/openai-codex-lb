@@ -1,0 +1,20 @@
+services:
+  codexlb-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: codexlb-proxy
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    command:
+      - proxy
+      - --root
+      - /data
+      - --listen
+      - 0.0.0.0:8765
+      - --upstream
+      - ${CODEXLB_UPSTREAM:-https://chatgpt.com/backend-api}
+    ports:
+      - "${CODEXLB_BIND_HOST:-127.0.0.1}:${CODEXLB_PORT:-8765}:8765"
+    volumes:
+      - "${CODEXLB_ROOT_DIR:-$HOME/.codex-lb}:/data"
