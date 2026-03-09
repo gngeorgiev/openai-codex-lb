@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -28,6 +29,10 @@ type ProxyServer struct {
 	usageClient   *http.Client
 	logger        *log.Logger
 	events        *EventLogger
+
+	authRefreshMu sync.Mutex
+	authTokenURL  string
+	authClientID  string
 
 	refreshInFlight atomic.Bool
 	requestSeq      atomic.Uint64
@@ -56,8 +61,10 @@ func NewProxyServer(store *Store, logger *log.Logger, events *EventLogger) *Prox
 		usageClient: &http.Client{
 			Transport: usageTransport,
 		},
-		logger: logger,
-		events: events,
+		logger:       logger,
+		events:       events,
+		authTokenURL: defaultAuthTokenURL,
+		authClientID: defaultAuthClientID,
 	}
 }
 
@@ -374,21 +381,57 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, now tim
 		if shouldDisableForAuthFailure(resp.StatusCode, r.URL.Path) {
 			bodySnippet := readBodySnippet(resp.Body, maxDisableBodyLogBytes)
 			_ = resp.Body.Close()
-			p.markDisabled(account.ID, fmt.Sprintf("http-%d", resp.StatusCode))
-			lastResp = resp
-			p.logEvent("account.disabled", map[string]any{
-				"req_id":     reqID,
-				"attempt":    attempt,
-				"account_id": account.ID,
-				"status":     resp.StatusCode,
-				"path":       r.URL.Path,
-				"method":     r.Method,
-				"error_body": bodySnippet,
-			})
-			if p.logger != nil {
-				p.logger.Printf("account disabled id=%s status=%d method=%s path=%s body=%q", account.ID, resp.StatusCode, r.Method, r.URL.Path, bodySnippet)
+			refreshedAuth, refreshed, refreshErr := p.tryRefreshAccountAuth(r.Context(), account, auth)
+			if refreshErr == nil && refreshed {
+				upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), bytes.NewReader(body))
+				if err != nil {
+					lastErr = err
+					break
+				}
+				upstreamReq.Header = cloneHeaders(r.Header)
+				setAccountHeaders(upstreamReq.Header, refreshedAuth)
+				upstreamReq.Host = targetURL.Host
+				resp, err = p.requestClient.Do(upstreamReq)
+				if err != nil {
+					p.markCooldown(account.ID, 0, snapshot.Settings.Proxy.CooldownDefaultS, "transport-error")
+					lastErr = err
+					p.logEvent("request.transport_error", map[string]any{
+						"req_id":     reqID,
+						"attempt":    attempt,
+						"account_id": account.ID,
+						"error":      err.Error(),
+					})
+					continue
+				}
+				if !shouldDisableForAuthFailure(resp.StatusCode, r.URL.Path) {
+					auth = refreshedAuth
+				}
 			}
-			continue
+			if refreshErr != nil || shouldDisableForAuthFailure(resp.StatusCode, r.URL.Path) {
+				p.markDisabled(account.ID, fmt.Sprintf("http-%d", resp.StatusCode))
+				lastResp = resp
+				fields := map[string]any{
+					"req_id":     reqID,
+					"attempt":    attempt,
+					"account_id": account.ID,
+					"status":     resp.StatusCode,
+					"path":       r.URL.Path,
+					"method":     r.Method,
+					"error_body": bodySnippet,
+				}
+				if refreshErr != nil {
+					fields["refresh_error"] = refreshErr.Error()
+				}
+				p.logEvent("account.disabled", fields)
+				if p.logger != nil {
+					if refreshErr != nil {
+						p.logger.Printf("account disabled id=%s status=%d method=%s path=%s body=%q refresh_error=%v", account.ID, resp.StatusCode, r.Method, r.URL.Path, bodySnippet, refreshErr)
+					} else {
+						p.logger.Printf("account disabled id=%s status=%d method=%s path=%s body=%q", account.ID, resp.StatusCode, r.Method, r.URL.Path, bodySnippet)
+					}
+				}
+				continue
+			}
 		}
 
 		if isRetryableStatus(resp.StatusCode) {
@@ -507,6 +550,9 @@ func (p *ProxyServer) handleWebsocket(w http.ResponseWriter, r *http.Request, no
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		if shouldDisableForAuthFailure(resp.StatusCode, r.URL.Path) {
+			if _, refreshed, err := p.tryRefreshAccountAuth(r.Context(), account, auth); err == nil && refreshed {
+				return nil
+			}
 			p.markDisabled(account.ID, fmt.Sprintf("http-%d", resp.StatusCode))
 			p.logEvent("account.disabled", map[string]any{
 				"req_id":     reqID,
@@ -627,6 +673,25 @@ func (p *ProxyServer) markDisabled(accountID, reason string) {
 	})
 }
 
+func (p *ProxyServer) markAuthRecovered(accountID string, auth AuthInfo) {
+	_ = p.store.Update(func(sf *StoreFile) error {
+		idx := slices.IndexFunc(sf.Accounts, func(a Account) bool { return a.ID == accountID })
+		if idx < 0 {
+			return nil
+		}
+		sf.Accounts[idx].Enabled = true
+		sf.Accounts[idx].DisabledReason = ""
+		sf.Accounts[idx].LastSwitchReason = "auth-refresh-recovered"
+		if auth.ChatGPTAccountID != "" {
+			sf.Accounts[idx].ChatGPTAccountID = auth.ChatGPTAccountID
+		}
+		if auth.UserEmail != "" {
+			sf.Accounts[idx].UserEmail = auth.UserEmail
+		}
+		return nil
+	})
+}
+
 func (p *ProxyServer) expireCooldowns(now time.Time) {
 	_ = p.store.Update(func(sf *StoreFile) error {
 		for i := range sf.Accounts {
@@ -656,11 +721,48 @@ func (p *ProxyServer) maybeRefreshQuota(ctx context.Context, now time.Time, forc
 			}
 			continue
 		}
+		if isAuthFailureReason(account.DisabledReason) {
+			refreshedAuth, refreshed, refreshErr := p.tryRefreshAccountAuth(ctx, account, auth)
+			if refreshErr != nil {
+				p.logEvent("account.auth_refresh_failed", map[string]any{
+					"account_id": account.ID,
+					"error":      refreshErr.Error(),
+					"force":      force,
+				})
+				if p.logger != nil {
+					p.logger.Printf("auth refresh failed account=%s force=%t error=%v", account.ID, force, refreshErr)
+				}
+				continue
+			}
+			if refreshed {
+				auth = refreshedAuth
+			}
+		}
 		timeout := time.Duration(max(1, snapshot.Settings.Proxy.UsageTimeoutMS)) * time.Millisecond
 		refreshCtx, cancel := context.WithTimeout(ctx, timeout)
 		updated := account
 		err = refreshQuotaForAccount(refreshCtx, p.usageClient, &updated, auth, now)
 		cancel()
+		if status := authFailureStatusFromError(err); status != 0 {
+			refreshedAuth, refreshed, refreshErr := p.tryRefreshAccountAuth(ctx, account, auth)
+			if refreshErr == nil && refreshed {
+				auth = refreshedAuth
+				refreshCtx, cancel = context.WithTimeout(ctx, timeout)
+				err = refreshQuotaForAccount(refreshCtx, p.usageClient, &updated, auth, now)
+				cancel()
+			}
+			if refreshErr != nil {
+				p.logEvent("account.auth_refresh_failed", map[string]any{
+					"account_id": account.ID,
+					"error":      refreshErr.Error(),
+					"force":      force,
+					"status":     status,
+				})
+				if p.logger != nil {
+					p.logger.Printf("auth refresh failed account=%s force=%t status=%d error=%v", account.ID, force, status, refreshErr)
+				}
+			}
+		}
 		if err != nil {
 			p.logEvent("quota.refresh_failed", map[string]any{
 				"account_id": account.ID,
@@ -707,6 +809,39 @@ func (p *ProxyServer) maybeRefreshQuota(ctx context.Context, now time.Time, forc
 			"last_sync_at_ms": updated.Quota.LastSyncAt,
 		})
 	}
+}
+
+func (p *ProxyServer) tryRefreshAccountAuth(ctx context.Context, account Account, failedAuth AuthInfo) (AuthInfo, bool, error) {
+	p.authRefreshMu.Lock()
+	defer p.authRefreshMu.Unlock()
+
+	current, err := LoadAuth(account.HomeDir)
+	if err != nil {
+		return AuthInfo{}, false, err
+	}
+	if failedAuth.AccessToken != "" && current.AccessToken != "" && current.AccessToken != failedAuth.AccessToken {
+		p.markAuthRecovered(account.ID, current)
+		p.logEvent("account.auth_refreshed", map[string]any{
+			"account_id": account.ID,
+			"mode":       "guarded-reload",
+		})
+		return current, true, nil
+	}
+
+	timeout := time.Duration(max(1, p.store.Snapshot().Settings.Proxy.UsageTimeoutMS)) * time.Millisecond
+	refreshCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	refreshed, err := RefreshAuth(refreshCtx, p.requestClient, account.HomeDir, p.authTokenURL, p.authClientID, failedAuth.AccessToken)
+	if err != nil {
+		return AuthInfo{}, false, err
+	}
+	p.markAuthRecovered(account.ID, refreshed)
+	p.logEvent("account.auth_refreshed", map[string]any{
+		"account_id": account.ID,
+		"mode":       "token-refresh",
+	})
+	return refreshed, true, nil
 }
 
 func (p *ProxyServer) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -819,6 +954,10 @@ func readBodySnippet(r io.Reader, maxBytes int) string {
 		return ""
 	}
 	return strings.TrimSpace(string(body))
+}
+
+func isAuthFailureReason(reason string) bool {
+	return reason == "http-401"
 }
 
 func (p *ProxyServer) logEvent(event string, fields map[string]any) {

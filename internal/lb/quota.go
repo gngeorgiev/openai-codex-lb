@@ -3,6 +3,7 @@ package lb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -26,6 +27,15 @@ type usageResponse struct {
 		PrimaryWindow   usageWindow `json:"primary_window"`
 		SecondaryWindow usageWindow `json:"secondary_window"`
 	} `json:"rate_limit"`
+}
+
+type upstreamStatusError struct {
+	Operation  string
+	StatusCode int
+}
+
+func (e *upstreamStatusError) Error() string {
+	return fmt.Sprintf("%s status %d", e.Operation, e.StatusCode)
 }
 
 func usageURL(base string) (string, error) {
@@ -76,7 +86,7 @@ func refreshQuotaForAccount(ctx context.Context, client *http.Client, account *A
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("usage status %d", resp.StatusCode)
+		return &upstreamStatusError{Operation: "usage", StatusCode: resp.StatusCode}
 	}
 	var payload usageResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
@@ -126,6 +136,17 @@ func parseRetryAfterSeconds(headers http.Header) int {
 		if delta > 0 {
 			return delta
 		}
+	}
+	return 0
+}
+
+func authFailureStatusFromError(err error) int {
+	var statusErr *upstreamStatusError
+	if !errors.As(err, &statusErr) {
+		return 0
+	}
+	if statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusForbidden {
+		return statusErr.StatusCode
 	}
 	return 0
 }
