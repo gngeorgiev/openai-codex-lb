@@ -59,6 +59,9 @@ make install PREFIX=$HOME/.local
 ```bash
 ./codexlb status
 ./codexlb status --short
+
+# Force the proxy to use a specific account while it remains healthy:
+./codexlb use alice
 ```
 
 4. Run Codex through proxy:
@@ -320,6 +323,16 @@ Usage:
 codexlb account pin [--root DIR] [--proxy-url URL] <alias>
 ```
 
+### `codexlb use`
+
+Shortcut for forcing selection to a specific account alias. This uses the same pinned-account state as `codexlb account pin`.
+
+Usage:
+
+```bash
+codexlb use [--root DIR] [--proxy-url URL] <alias>
+```
+
 ### `codexlb account unpin`
 
 Clear pinned account selection.
@@ -523,6 +536,7 @@ CODEXLB_RUN_REAL_CODEX_TEST=1 go test ./internal/lb -run TestRealCodexUsesOPENAI
 codexlb --help
 codexlb proxy --help
 codexlb account login --help
+codexlb use --help
 codexlb run --help
 codexlb status --help
 ```

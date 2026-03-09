@@ -36,6 +36,8 @@ func run(argv []string) int {
 		return runProxy(argv[1:])
 	case "account":
 		return runAccount(argv[1:])
+	case "use":
+		return runUse(argv[1:])
 	case "status":
 		return runStatus(argv[1:])
 	case "run":
@@ -524,16 +526,41 @@ Flags:
 }
 
 func runAccountPin(argv []string) int {
-	fs := flag.NewFlagSet("account pin", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
-	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), `Usage: codexlb account pin [flags] <alias>
+	return runPinCommand(
+		argv,
+		"account pin",
+		`Usage: codexlb account pin [flags] <alias>
 
 Pins account selection to a specific alias while it remains healthy.
 
 Flags:
-`)
+`,
+		"pin account",
+		"pinned account %s\n",
+	)
+}
+
+func runUse(argv []string) int {
+	return runPinCommand(
+		argv,
+		"use",
+		`Usage: codexlb use [flags] <alias>
+
+Forces the proxy to prefer a specific account alias while it remains healthy.
+
+Flags:
+`,
+		"use account",
+		"using account %s\n",
+	)
+}
+
+func runPinCommand(argv []string, flagSetName, usage, errPrefix, successFormat string) int {
+	fs := flag.NewFlagSet(flagSetName, flag.ContinueOnError)
+	root := fs.String("root", "", "State directory")
+	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), usage)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(argv); err != nil {
@@ -547,10 +574,10 @@ Flags:
 	alias := args[0]
 	if strings.TrimSpace(*proxyURL) != "" {
 		if _, err := remoteAdminPin(*proxyURL, alias); err != nil {
-			fmt.Fprintf(os.Stderr, "pin account (remote): %v\n", err)
+			fmt.Fprintf(os.Stderr, "%s (remote): %v\n", errPrefix, err)
 			return 1
 		}
-		fmt.Printf("pinned account %s\n", alias)
+		fmt.Printf(successFormat, alias)
 		return 0
 	}
 
@@ -561,10 +588,10 @@ Flags:
 	}
 	if shouldAutoRemoteAccount(store, *root) {
 		if err := tryRemotePinWithFallback(store, alias); err == nil {
-			fmt.Printf("pinned account %s\n", alias)
+			fmt.Printf(successFormat, alias)
 			return 0
 		} else if !isRemoteAdminUnavailable(err) {
-			fmt.Fprintf(os.Stderr, "pin account (remote): %v\n", err)
+			fmt.Fprintf(os.Stderr, "%s (remote): %v\n", errPrefix, err)
 			return 1
 		}
 	}
@@ -577,17 +604,17 @@ Flags:
 		}
 	}
 	if pinnedID == "" {
-		fmt.Fprintf(os.Stderr, "pin account: alias not found: %s\n", alias)
+		fmt.Fprintf(os.Stderr, "%s: alias not found: %s\n", errPrefix, alias)
 		return 1
 	}
 	if err := store.Update(func(sf *lb.StoreFile) error {
 		sf.State.PinnedAccountID = pinnedID
 		return nil
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "pin account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "%s: %v\n", errPrefix, err)
 		return 1
 	}
-	fmt.Printf("pinned account %s\n", alias)
+	fmt.Printf(successFormat, alias)
 	return 0
 }
 
@@ -959,7 +986,7 @@ Subcommands:
   import  import auth.json from existing CODEX_HOME
   list    show registered accounts
   rm      remove an account
-  pin     pin account selection to alias
+  pin     pin account selection to alias (same selection state as 'codexlb use')
   unpin   clear pinned account selection
 
 Run 'codexlb account <subcommand> --help' for detailed flags.
@@ -975,6 +1002,7 @@ Usage:
 Commands:
   proxy    Run proxy server (or use 'proxy logs')
   account  Manage enrolled accounts (login/import/list/rm/pin/unpin)
+  use      Force account selection to alias
   status   Show runtime status table from running proxy
   run      Run codex with proxy endpoint environment wiring
 

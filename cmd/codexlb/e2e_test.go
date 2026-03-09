@@ -267,6 +267,46 @@ func TestAccountPinUnknownAlias(t *testing.T) {
 	}
 }
 
+func TestUsePinsAccount(t *testing.T) {
+	root := t.TempDir()
+	store, err := lb.OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	sourceA := filepath.Join(root, "source-a")
+	if err := os.MkdirAll(sourceA, 0o700); err != nil {
+		t.Fatalf("mkdir source-a: %v", err)
+	}
+	tokenA := testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	})
+	if err := os.WriteFile(filepath.Join(sourceA, "auth.json"), []byte(`{"tokens":{"access_token":"`+tokenA+`","account_id":"acct-a"}}`), 0o600); err != nil {
+		t.Fatalf("write source-a auth: %v", err)
+	}
+	if err := lb.ImportAccount(store, "alice", sourceA); err != nil {
+		t.Fatalf("import alice: %v", err)
+	}
+
+	out, code := captureStdout(func() int {
+		return run([]string{"use", "--root", root, "alice"})
+	})
+	if code != 0 {
+		t.Fatalf("use failed: %d output=%s", code, out)
+	}
+	if !strings.Contains(out, "using account alice") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+
+	reloaded, err := lb.OpenStore(root)
+	if err != nil {
+		t.Fatalf("reopen store after use: %v", err)
+	}
+	if got := reloaded.Snapshot().State.PinnedAccountID; got != "openai:alice" {
+		t.Fatalf("expected pinned account openai:alice, got %q", got)
+	}
+}
+
 func TestE2EConfiguredLoginCommand(t *testing.T) {
 	root := t.TempDir()
 	fakeLog := filepath.Join(root, "fake-codex.log")

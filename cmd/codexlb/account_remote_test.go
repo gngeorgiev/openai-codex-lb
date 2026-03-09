@@ -334,3 +334,47 @@ func TestAccountUnpinDefaultsToConfiguredProxyURL(t *testing.T) {
 		t.Fatalf("unexpected output: %q", out)
 	}
 }
+
+func TestUseDefaultsToConfiguredProxyURL(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/admin/account/pin" {
+			http.NotFound(w, r)
+			return
+		}
+		calls++
+		var req lb.AdminAliasRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Alias != "g" {
+			t.Fatalf("unexpected alias: %q", req.Alias)
+		}
+		_ = json.NewEncoder(w).Encode(lb.AdminMutationResponse{OK: true})
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	store, err := lb.OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	cfg := store.Snapshot().Settings
+	cfg.ProxyURL = server.URL
+	if err := lb.WriteSettingsConfig(root, cfg); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	out, code := captureStdout(func() int {
+		return run([]string{"use", "--root", root, "g"})
+	})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d out=%s", code, out)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one remote pin call, got %d", calls)
+	}
+	if !strings.Contains(out, "using account g") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+}
