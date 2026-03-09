@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gngeorgiev/openai-codex-lb/internal/lb"
@@ -62,6 +64,31 @@ func remoteAdminImportWithClient(client *http.Client, proxyURL, alias, from stri
 	req := lb.AdminImportRequest{Alias: alias, FromHome: from}
 	var resp lb.AdminMutationResponse
 	err := callRemoteAdminJSONWithClient(client, http.MethodPost, strings.TrimRight(proxyURL, "/")+"/admin/account/import", req, &resp)
+	return resp, err
+}
+
+func remoteAdminImportHome(proxyURL, alias, home string) (lb.AdminMutationResponse, error) {
+	return remoteAdminImportHomeWithClient(http.DefaultClient, proxyURL, alias, home)
+}
+
+func remoteAdminImportHomeWithClient(client *http.Client, proxyURL, alias, home string) (lb.AdminMutationResponse, error) {
+	authPath := filepath.Join(home, "auth.json")
+	authData, err := os.ReadFile(authPath)
+	if err != nil {
+		return lb.AdminMutationResponse{}, fmt.Errorf("read %s: %w", authPath, err)
+	}
+	var configData []byte
+	configPath := filepath.Join(home, "config.toml")
+	if data, err := os.ReadFile(configPath); err == nil {
+		configData = data
+	}
+	req := lb.AdminImportRequest{
+		Alias:  alias,
+		Auth:   json.RawMessage(authData),
+		Config: string(configData),
+	}
+	var resp lb.AdminMutationResponse
+	err = callRemoteAdminJSONWithClient(client, http.MethodPost, strings.TrimRight(proxyURL, "/")+"/admin/account/import", req, &resp)
 	return resp, err
 }
 

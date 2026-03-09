@@ -67,6 +67,40 @@ func TestProxyAdminImportListPinUnpinRemove(t *testing.T) {
 	}
 }
 
+func TestProxyAdminImportFromUploadedData(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	srv := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer srv.Close()
+
+	token := testAdminJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-b"},
+		"https://api.openai.com/profile": map[string]any{"email": "bob@example.com"},
+	})
+	auth := map[string]any{"tokens": map[string]any{"access_token": token, "account_id": "acct-b"}}
+	b, _ := json.Marshal(auth)
+
+	callAdminJSON(t, http.MethodPost, srv.URL+"/admin/account/import", AdminImportRequest{
+		Alias:  "bob",
+		Auth:   b,
+		Config: "model = \"gpt-5\"\n",
+	}, nil)
+
+	snap := store.Snapshot()
+	if len(snap.Accounts) != 1 || snap.Accounts[0].Alias != "bob" {
+		t.Fatalf("unexpected accounts after uploaded import: %+v", snap.Accounts)
+	}
+	if got := snap.Accounts[0].UserEmail; got != "bob@example.com" {
+		t.Fatalf("unexpected email after uploaded import: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "accounts", "bob", "config.toml")); err != nil {
+		t.Fatalf("expected uploaded config.toml to persist: %v", err)
+	}
+}
+
 func callAdminJSON(t *testing.T, method, url string, reqBody any, respBody any) {
 	t.Helper()
 	var body *bytes.Reader

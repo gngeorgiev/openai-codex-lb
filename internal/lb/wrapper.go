@@ -34,6 +34,20 @@ func LoginAccount(store *Store, alias, codexBin string, loginArgs []string) erro
 		return err
 	}
 	home := AccountHomeDir(store, alias)
+	if err := loginAccountHome(store, home, codexBin, loginArgs); err != nil {
+		return err
+	}
+	return RegisterAccount(store, alias, home)
+}
+
+func LoginAccountToHome(store *Store, alias, home, codexBin string, loginArgs []string) error {
+	if err := ValidateAlias(alias); err != nil {
+		return err
+	}
+	return loginAccountHome(store, home, codexBin, loginArgs)
+}
+
+func loginAccountHome(store *Store, home, codexBin string, loginArgs []string) error {
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		return fmt.Errorf("create account home: %w", err)
 	}
@@ -54,7 +68,7 @@ func LoginAccount(store *Store, alias, codexBin string, loginArgs []string) erro
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("run %s %s: %w", codexBin, strings.Join(args, " "), err)
 	}
-	return RegisterAccount(store, alias, home)
+	return nil
 }
 
 func ImportAccount(store *Store, alias, fromHome string) error {
@@ -68,17 +82,35 @@ func ImportAccount(store *Store, alias, fromHome string) error {
 	if _, err := os.Stat(srcAuth); err != nil {
 		return fmt.Errorf("source auth missing at %s: %w", srcAuth, err)
 	}
+	authData, err := os.ReadFile(srcAuth)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", srcAuth, err)
+	}
+	var configData []byte
+	srcConfig := filepath.Join(fromHome, "config.toml")
+	if _, err := os.Stat(srcConfig); err == nil {
+		configData, _ = os.ReadFile(srcConfig)
+	}
+	return ImportAccountData(store, alias, authData, configData)
+}
+
+func ImportAccountData(store *Store, alias string, authData, configData []byte) error {
+	if err := ValidateAlias(alias); err != nil {
+		return err
+	}
+	if len(authData) == 0 {
+		return fmt.Errorf("source auth is required")
+	}
 	home := AccountHomeDir(store, alias)
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		return fmt.Errorf("create account home: %w", err)
 	}
-	if err := copyFile(srcAuth, filepath.Join(home, "auth.json"), 0o600); err != nil {
-		return err
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), authData, 0o600); err != nil {
+		return fmt.Errorf("write auth.json: %w", err)
 	}
-	for _, opt := range []string{"config.toml"} {
-		src := filepath.Join(fromHome, opt)
-		if _, err := os.Stat(src); err == nil {
-			_ = copyFile(src, filepath.Join(home, opt), 0o600)
+	if len(configData) > 0 {
+		if err := os.WriteFile(filepath.Join(home, "config.toml"), configData, 0o600); err != nil {
+			return fmt.Errorf("write config.toml: %w", err)
 		}
 	}
 	return RegisterAccount(store, alias, home)

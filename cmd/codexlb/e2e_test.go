@@ -267,7 +267,7 @@ func TestAccountPinUnknownAlias(t *testing.T) {
 	}
 }
 
-func TestUsePinsAccount(t *testing.T) {
+func TestAccountPinPinsAccount(t *testing.T) {
 	root := t.TempDir()
 	store, err := lb.OpenStore(root)
 	if err != nil {
@@ -289,18 +289,18 @@ func TestUsePinsAccount(t *testing.T) {
 	}
 
 	out, code := captureStdout(func() int {
-		return run([]string{"use", "--root", root, "alice"})
+		return run([]string{"account", "pin", "--root", root, "alice"})
 	})
 	if code != 0 {
-		t.Fatalf("use failed: %d output=%s", code, out)
+		t.Fatalf("account pin failed: %d output=%s", code, out)
 	}
-	if !strings.Contains(out, "using account alice") {
+	if !strings.Contains(out, "pinned account alice") {
 		t.Fatalf("unexpected output: %q", out)
 	}
 
 	reloaded, err := lb.OpenStore(root)
 	if err != nil {
-		t.Fatalf("reopen store after use: %v", err)
+		t.Fatalf("reopen store after pin: %v", err)
 	}
 	if got := reloaded.Snapshot().State.PinnedAccountID; got != "openai:alice" {
 		t.Fatalf("expected pinned account openai:alice, got %q", got)

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -83,26 +85,125 @@ func TestAccountPinRemoteError(t *testing.T) {
 	}
 }
 
-func TestAccountLoginDefaultsToConfiguredProxyURL(t *testing.T) {
-	calls := 0
+func TestAccountLoginRemoteRunsLocallyAndImports(t *testing.T) {
+	root := t.TempDir()
+	fakeLog := filepath.Join(root, "fake-codex.log")
+	fakeBin := filepath.Join(root, "codex")
+	writeFakeCodex(t, fakeBin)
+
+	t.Setenv("CODEXLB_CODEX_BIN", fakeBin)
+	t.Setenv("FAKE_LOG", fakeLog)
+	t.Setenv("FAKE_TOKEN", testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-a"},
+		"https://api.openai.com/profile": map[string]any{"email": "alice@example.com"},
+	}))
+	t.Setenv("FAKE_ACCOUNT_ID", "acct-a")
+
+	importCalls := 0
+	loginCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/admin/account/login" {
+		switch r.URL.Path {
+		case "/admin/account/login":
+			loginCalls++
+			http.NotFound(w, r)
+			return
+		case "/admin/account/import":
+		default:
 			http.NotFound(w, r)
 			return
 		}
-		calls++
-		var req lb.AdminLoginRequest
+		importCalls++
+		var req lb.AdminImportRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		if req.Alias != "alice" {
 			t.Fatalf("unexpected alias: %q", req.Alias)
 		}
+		if len(req.Auth) == 0 || !json.Valid(req.Auth) {
+			t.Fatalf("expected auth payload to be uploaded")
+		}
+		var auth map[string]any
+		if err := json.Unmarshal(req.Auth, &auth); err != nil {
+			t.Fatalf("unmarshal auth payload: %v", err)
+		}
+		tokens, _ := auth["tokens"].(map[string]any)
+		if got, _ := tokens["account_id"].(string); got != "acct-a" {
+			t.Fatalf("unexpected uploaded account id: %q", got)
+		}
 		_ = json.NewEncoder(w).Encode(lb.AdminMutationResponse{OK: true, Total: 3})
 	}))
 	defer server.Close()
 
+	out, code := captureStdout(func() int {
+		return run([]string{"account", "login", "--root", root, "--proxy-url", server.URL, "alice"})
+	})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d out=%s", code, out)
+	}
+	if importCalls != 1 {
+		t.Fatalf("expected one remote import call, got %d", importCalls)
+	}
+	if loginCalls != 0 {
+		t.Fatalf("expected no remote login calls, got %d", loginCalls)
+	}
+	if !strings.Contains(out, "registered account alice (total=3)") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	data, err := os.ReadFile(fakeLog)
+	if err != nil {
+		t.Fatalf("read fake log: %v", err)
+	}
+	if !strings.Contains(string(data), "LOGIN_ARGS=login") {
+		t.Fatalf("expected local codex login to run, got: %s", string(data))
+	}
+	store, err := lb.OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store after remote login: %v", err)
+	}
+	if got := len(store.Snapshot().Accounts); got != 0 {
+		t.Fatalf("expected no local accounts to be registered, got %d", got)
+	}
+}
+
+func TestAccountLoginDefaultsToConfiguredProxyURL(t *testing.T) {
 	root := t.TempDir()
+	fakeLog := filepath.Join(root, "fake-codex.log")
+	fakeBin := filepath.Join(root, "codex")
+	writeFakeCodex(t, fakeBin)
+
+	t.Setenv("CODEXLB_CODEX_BIN", fakeBin)
+	t.Setenv("FAKE_LOG", fakeLog)
+	t.Setenv("FAKE_TOKEN", testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	}))
+	t.Setenv("FAKE_ACCOUNT_ID", "acct-a")
+
+	importCalls := 0
+	loginCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/admin/account/login":
+			loginCalls++
+			http.NotFound(w, r)
+			return
+		case "/admin/account/import":
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		importCalls++
+		var req lb.AdminImportRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if req.Alias != "alice" || len(req.Auth) == 0 {
+			t.Fatalf("unexpected request: %+v", req)
+		}
+		_ = json.NewEncoder(w).Encode(lb.AdminMutationResponse{OK: true, Total: 3})
+	}))
+	defer server.Close()
+
 	store, err := lb.OpenStore(root)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -119,11 +220,21 @@ func TestAccountLoginDefaultsToConfiguredProxyURL(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d out=%s", code, out)
 	}
-	if calls != 1 {
-		t.Fatalf("expected one remote login call, got %d", calls)
+	if importCalls != 1 {
+		t.Fatalf("expected one remote import call, got %d", importCalls)
+	}
+	if loginCalls != 0 {
+		t.Fatalf("expected zero remote login calls, got %d", loginCalls)
 	}
 	if !strings.Contains(out, "registered account alice (total=3)") {
 		t.Fatalf("unexpected output: %q", out)
+	}
+	data, err := os.ReadFile(fakeLog)
+	if err != nil {
+		t.Fatalf("read fake log: %v", err)
+	}
+	if !strings.Contains(string(data), "LOGIN_ARGS=login") {
+		t.Fatalf("expected local codex login to run, got: %s", string(data))
 	}
 }
 
@@ -366,7 +477,7 @@ func TestUseDefaultsToConfiguredProxyURL(t *testing.T) {
 	}
 
 	out, code := captureStdout(func() int {
-		return run([]string{"use", "--root", root, "g"})
+		return run([]string{"account", "pin", "--root", root, "g"})
 	})
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d out=%s", code, out)
@@ -374,7 +485,7 @@ func TestUseDefaultsToConfiguredProxyURL(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("expected one remote pin call, got %d", calls)
 	}
-	if !strings.Contains(out, "using account g") {
+	if !strings.Contains(out, "pinned account g") {
 		t.Fatalf("unexpected output: %q", out)
 	}
 }

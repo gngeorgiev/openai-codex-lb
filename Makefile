@@ -3,7 +3,7 @@ SHELL := /bin/bash
 GO ?= go
 BINARY ?= codexlb
 CMD ?= ./cmd/codexlb
-PREFIX ?= /usr/local
+PREFIX ?= $(HOME)/.g/go
 BINDIR ?= $(PREFIX)/bin
 DESTDIR ?=
 

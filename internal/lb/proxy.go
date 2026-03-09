@@ -202,11 +202,21 @@ func (p *ProxyServer) handleAdmin(w http.ResponseWriter, r *http.Request) int {
 			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid import request: %v", err))
 			return http.StatusBadRequest
 		}
-		if strings.TrimSpace(req.Alias) == "" || strings.TrimSpace(req.FromHome) == "" {
-			writeJSONError(w, http.StatusBadRequest, "alias and from_home are required")
+		if strings.TrimSpace(req.Alias) == "" {
+			writeJSONError(w, http.StatusBadRequest, "alias is required")
 			return http.StatusBadRequest
 		}
-		if err := ImportAccount(p.store, req.Alias, req.FromHome); err != nil {
+		var err error
+		switch {
+		case len(req.Auth) > 0:
+			err = ImportAccountData(p.store, req.Alias, req.Auth, []byte(req.Config))
+		case strings.TrimSpace(req.FromHome) != "":
+			err = ImportAccount(p.store, req.Alias, req.FromHome)
+		default:
+			writeJSONError(w, http.StatusBadRequest, "from_home or auth is required")
+			return http.StatusBadRequest
+		}
+		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return http.StatusBadRequest
 		}

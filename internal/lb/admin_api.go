@@ -13,8 +13,10 @@ type AdminLoginRequest struct {
 }
 
 type AdminImportRequest struct {
-	Alias    string `json:"alias"`
-	FromHome string `json:"from_home"`
+	Alias    string          `json:"alias"`
+	FromHome string          `json:"from_home,omitempty"`
+	Auth     json.RawMessage `json:"auth,omitempty"`
+	Config   string          `json:"config,omitempty"`
 }
 
 type AdminAliasRequest struct {

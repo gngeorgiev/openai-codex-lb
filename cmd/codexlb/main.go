@@ -36,8 +36,6 @@ func run(argv []string) int {
 		return runProxy(argv[1:])
 	case "account":
 		return runAccount(argv[1:])
-	case "use":
-		return runUse(argv[1:])
 	case "status":
 		return runStatus(argv[1:])
 	case "run":
@@ -342,20 +340,19 @@ Flags:
 	if len(args) > 1 {
 		loginArgs = args[1:]
 	}
+	store, err := lb.OpenStore(*root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		return 1
+	}
 	if strings.TrimSpace(*proxyURL) != "" {
-		resp, err := remoteAdminLogin(*proxyURL, alias, *codexBin, loginArgs)
+		resp, err := loginAccountRemote(store, *proxyURL, alias, *codexBin, loginArgs)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "login account (remote): %v\n", err)
 			return 1
 		}
 		fmt.Printf("registered account %s (total=%d)\n", alias, resp.Total)
 		return 0
-	}
-
-	store, err := lb.OpenStore(*root)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
-		return 1
 	}
 	if shouldAutoRemoteAccount(store, *root) {
 		if resp, err := tryRemoteLoginWithFallback(store, alias, *codexBin, loginArgs); err == nil {
@@ -540,21 +537,6 @@ Flags:
 	)
 }
 
-func runUse(argv []string) int {
-	return runPinCommand(
-		argv,
-		"use",
-		`Usage: codexlb use [flags] <alias>
-
-Forces the proxy to prefer a specific account alias while it remains healthy.
-
-Flags:
-`,
-		"use account",
-		"using account %s\n",
-	)
-}
-
 func runPinCommand(argv []string, flagSetName, usage, errPrefix, successFormat string) int {
 	fs := flag.NewFlagSet(flagSetName, flag.ContinueOnError)
 	root := fs.String("root", "", "State directory")
@@ -685,11 +667,28 @@ func tryRemoteUnpinWithFallback(store *lb.Store) error {
 }
 
 func tryRemoteLoginWithFallback(store *lb.Store, alias, codexBin string, loginArgs []string) (lb.AdminMutationResponse, error) {
-	return remoteAdminLoginWithClient(remoteAdminFallbackClient(), resolveProxyURL(store, ""), alias, codexBin, loginArgs)
+	return loginAccountRemoteWithClient(store, remoteAdminFallbackClient(), resolveProxyURL(store, ""), alias, codexBin, loginArgs)
 }
 
 func tryRemoteImportWithFallback(store *lb.Store, alias, from string) (lb.AdminMutationResponse, error) {
 	return remoteAdminImportWithClient(remoteAdminFallbackClient(), resolveProxyURL(store, ""), alias, from)
+}
+
+func loginAccountRemote(store *lb.Store, proxyURL, alias, codexBin string, loginArgs []string) (lb.AdminMutationResponse, error) {
+	return loginAccountRemoteWithClient(store, http.DefaultClient, proxyURL, alias, codexBin, loginArgs)
+}
+
+func loginAccountRemoteWithClient(store *lb.Store, client *http.Client, proxyURL, alias, codexBin string, loginArgs []string) (lb.AdminMutationResponse, error) {
+	loginHome, err := os.MkdirTemp("", "codexlb-login-*")
+	if err != nil {
+		return lb.AdminMutationResponse{}, fmt.Errorf("create temp login home: %w", err)
+	}
+	defer os.RemoveAll(loginHome)
+
+	if err := lb.LoginAccountToHome(store, alias, loginHome, codexBin, loginArgs); err != nil {
+		return lb.AdminMutationResponse{}, err
+	}
+	return remoteAdminImportHomeWithClient(client, proxyURL, alias, loginHome)
 }
 
 func tryRemoteListWithFallback(store *lb.Store) ([]lb.Account, error) {
@@ -986,7 +985,7 @@ Subcommands:
   import  import auth.json from existing CODEX_HOME
   list    show registered accounts
   rm      remove an account
-  pin     pin account selection to alias (same selection state as 'codexlb use')
+  pin     pin account selection to alias
   unpin   clear pinned account selection
 
 Run 'codexlb account <subcommand> --help' for detailed flags.
@@ -1002,7 +1001,6 @@ Usage:
 Commands:
   proxy    Run proxy server (or use 'proxy logs')
   account  Manage enrolled accounts (login/import/list/rm/pin/unpin)
-  use      Force account selection to alias
   status   Show runtime status table from running proxy
   run      Run codex with proxy endpoint environment wiring
 
