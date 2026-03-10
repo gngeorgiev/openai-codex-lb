@@ -346,7 +346,7 @@ func fetchRemoteRuntimeAuth(proxyURL string) ([]byte, error) {
 	}
 	url = strings.TrimRight(url, "/") + "/admin/runtime-auth"
 
-	client := &http.Client{Timeout: 1500 * time.Millisecond}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err

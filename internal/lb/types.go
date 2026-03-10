@@ -107,7 +107,7 @@ func defaultStore() StoreFile {
 				Listen:           "127.0.0.1:8765",
 				UpstreamBaseURL:  "https://chatgpt.com/backend-api",
 				MaxAttempts:      3,
-				UsageTimeoutMS:   15000,
+				UsageTimeoutMS:   30000,
 				CooldownDefaultS: 5,
 			},
 			ProxyURL: "",

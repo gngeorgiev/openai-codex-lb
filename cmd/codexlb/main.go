@@ -71,7 +71,7 @@ Subcommands:
 	listen := fs.String("listen", "", "Listen address, e.g. 127.0.0.1:8765")
 	upstream := fs.String("upstream", "", "Upstream base URL, e.g. https://chatgpt.com/backend-api")
 	maxAttempts := fs.Int("max-attempts", 0, "Retry attempts per request before returning last upstream response")
-	usageTimeoutMS := fs.Int("usage-timeout-ms", 0, "Timeout for usage-refresh API requests")
+	usageTimeoutMS := fs.Int("usage-timeout-ms", 0, "Timeout for quota/auth refresh API requests")
 	cooldownDefaultSeconds := fs.Int("cooldown-default-seconds", 0, "Default cooldown on retryable transport/upstream errors")
 	quotaRefreshMinutes := fs.Int("quota-refresh-minutes", 0, "Quota refresh interval in minutes")
 	quotaRefreshMessages := fs.Int("quota-refresh-messages", 0, "Quota refresh interval in successful messages")
@@ -700,7 +700,7 @@ func tryRemoteRemoveWithFallback(store *lb.Store, alias string) (lb.AdminMutatio
 }
 
 func remoteAdminFallbackClient() *http.Client {
-	return &http.Client{Timeout: 750 * time.Millisecond}
+	return &http.Client{Timeout: 2 * time.Second}
 }
 
 func shouldAutoRemoteAccount(store *lb.Store, rootArg string) bool {

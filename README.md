@@ -135,7 +135,7 @@ upstream_base_url = "https://chatgpt.com/backend-api"
 # If empty, falls back to "http://<proxy.listen>".
 proxy_url = ""
 max_attempts = 3
-usage_timeout_ms = 15000
+usage_timeout_ms = 30000
 cooldown_default_seconds = 5
 
 [policy]
