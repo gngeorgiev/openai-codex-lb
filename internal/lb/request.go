@@ -8,6 +8,27 @@ import (
 	"strings"
 )
 
+var hopByHopHeaderNames = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+var forwardedHeaderNames = []string{
+	"Forwarded",
+	"Via",
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"X-Real-Ip",
+}
+
 func rewriteForAccount(src *url.URL, baseURL string) (*url.URL, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
@@ -58,6 +79,39 @@ func setAccountHeaders(headers http.Header, info AuthInfo) {
 	if info.ChatGPTAccountID != "" {
 		headers.Set("ChatGPT-Account-Id", info.ChatGPTAccountID)
 	}
+}
+
+func sanitizeForwardHeaders(src http.Header) http.Header {
+	out := cloneHeaders(src)
+	removeConnectionHeaders(out)
+	for _, name := range forwardedHeaderNames {
+		out.Del(name)
+	}
+	return out
+}
+
+func sanitizeResponseHeaders(src http.Header) http.Header {
+	out := cloneHeaders(src)
+	removeConnectionHeaders(out)
+	return out
+}
+
+func removeConnectionHeaders(headers http.Header) {
+	connectionTokens := append([]string(nil), headers.Values("Connection")...)
+	for _, name := range hopByHopHeaderNames {
+		headers.Del(name)
+	}
+	for _, value := range connectionTokens {
+		for _, token := range strings.Split(value, ",") {
+			if token = strings.TrimSpace(token); token != "" {
+				headers.Del(token)
+			}
+		}
+	}
+}
+
+func isControlPlanePath(path string) bool {
+	return path == "/healthz" || path == "/status" || path == "/logs" || strings.HasPrefix(path, "/admin/")
 }
 
 func isRetryableStatus(status int) bool {

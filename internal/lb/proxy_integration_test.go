@@ -746,12 +746,45 @@ func TestProxyDoesNotDisableAccountOn403ForNonAccountPath(t *testing.T) {
 	}
 }
 
-func TestProxyRootEndpointIsLocalHealth(t *testing.T) {
+func TestProxyRootPathPassesThroughToUpstream(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
 	store, err := OpenStore(tmp)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
+	}
+
+	token := testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	})
+	home := filepath.Join(tmp, "acc-a")
+	writeAuthFile(t, home, token, "acct-a")
+
+	var hitPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true,"source":"upstream"}`)
+	}))
+	defer upstream.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.UpstreamBaseURL = upstream.URL + "/backend-api"
+		sf.Settings.Proxy.MaxAttempts = 1
+		sf.Accounts = []Account{{
+			ID:      "a",
+			Alias:   "a",
+			HomeDir: home,
+			BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+			Enabled: true,
+			Quota: QuotaState{
+				LastSyncAt:             time.Now().UnixMilli(),
+				LastSyncMessageCounter: sf.State.MessageCounter,
+			},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
 	}
 
 	proxySrv := httptest.NewServer(NewProxyServer(store, nil, nil))
@@ -767,9 +800,215 @@ func TestProxyRootEndpointIsLocalHealth(t *testing.T) {
 		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "codexlb-proxy") {
-		t.Fatalf("expected local root response body, got %q", string(body))
+	if !strings.Contains(string(body), `"source":"upstream"`) {
+		t.Fatalf("expected proxied root response body, got %q", string(body))
 	}
+	if hitPath != "/backend-api" {
+		t.Fatalf("expected root request to be proxied to /backend-api, got %q", hitPath)
+	}
+}
+
+func TestProxyStripsForwardingAndHopByHopHeaders(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	token := testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	})
+	home := filepath.Join(tmp, "acc-a")
+	writeAuthFile(t, home, token, "acct-a")
+
+	var gotHeader http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Clone()
+		w.Header().Set("Connection", "x-remove-me")
+		w.Header().Set("X-Remove-Me", "secret")
+		w.Header().Set("X-Upstream", "kept")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.UpstreamBaseURL = upstream.URL + "/backend-api"
+		sf.Settings.Proxy.MaxAttempts = 1
+		sf.Accounts = []Account{{
+			ID:      "a",
+			Alias:   "a",
+			HomeDir: home,
+			BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+			Enabled: true,
+			Quota: QuotaState{
+				LastSyncAt:             time.Now().UnixMilli(),
+				LastSyncMessageCounter: sf.State.MessageCounter,
+			},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxySrv := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer proxySrv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, proxySrv.URL+"/models", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Forwarded", "for=1.1.1.1")
+	req.Header.Set("Via", "1.1 proxy")
+	req.Header.Set("X-Forwarded-For", "1.1.1.1")
+	req.Header.Set("X-Forwarded-Host", "proxy.test")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Header.Set("X-Real-Ip", "1.1.1.1")
+	req.Header.Set("Connection", "keep-alive, x-custom-hop")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Proxy-Authorization", "Basic abc")
+	req.Header.Set("Te", "trailers")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("X-Custom-Hop", "remove-me")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+
+	for _, name := range []string{"Forwarded", "Via", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip", "Connection", "Keep-Alive", "Proxy-Authorization", "Te", "Upgrade", "X-Custom-Hop"} {
+		if gotHeader.Get(name) != "" {
+			t.Fatalf("expected header %s to be stripped, got %q", name, gotHeader.Get(name))
+		}
+	}
+	if gotHeader.Get("Authorization") != "Bearer "+token {
+		t.Fatalf("expected auth header to be rewritten, got %q", gotHeader.Get("Authorization"))
+	}
+	if resp.Header.Get("Connection") != "" {
+		t.Fatalf("expected Connection header stripped from response, got %q", resp.Header.Get("Connection"))
+	}
+	if resp.Header.Get("X-Remove-Me") != "" {
+		t.Fatalf("expected hop-by-hop response token stripped, got %q", resp.Header.Get("X-Remove-Me"))
+	}
+	if resp.Header.Get("X-Upstream") != "kept" {
+		t.Fatalf("expected normal response header preserved, got %q", resp.Header.Get("X-Upstream"))
+	}
+}
+
+func TestProxyControlEndpointsRequireLoopback(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	proxy := NewProxyServer(store, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.test/status", nil)
+	req.RemoteAddr = "10.0.0.5:1234"
+	rr := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-loopback control request, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestProxyStreamsNonReplayableBodyWhenRetriesDisabled(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	token := testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	})
+	home := filepath.Join(tmp, "acc-a")
+	writeAuthFile(t, home, token, "acct-a")
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.UpstreamBaseURL = "https://upstream.test/backend-api"
+		sf.Settings.Proxy.MaxAttempts = 1
+		sf.Accounts = []Account{{
+			ID:      "a",
+			Alias:   "a",
+			HomeDir: home,
+			BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+			Enabled: true,
+			Quota: QuotaState{
+				LastSyncAt:             time.Now().UnixMilli(),
+				LastSyncMessageCounter: sf.State.MessageCounter,
+			},
+		}}
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxy := NewProxyServer(store, nil, nil)
+	body := &trackingReadCloser{Reader: strings.NewReader(`{"input":"hi"}`)}
+	var sawSameBody bool
+	proxy.requestClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got, ok := req.Body.(*trackingReadCloser); ok && got == body {
+			sawSameBody = true
+		}
+		payload, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		if string(payload) != `{"input":"hi"}` {
+			return nil, errors.New("unexpected request body")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		}, nil
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "http://proxy.test/models", body)
+	req.RemoteAddr = "127.0.0.1:1234"
+	rr := httptest.NewRecorder()
+
+	proxy.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !sawSameBody {
+		t.Fatalf("expected proxy to stream original request body without buffering")
+	}
+	if body.reads == 0 {
+		t.Fatalf("expected request body to be consumed by upstream transport")
+	}
+}
+
+type trackingReadCloser struct {
+	*strings.Reader
+	reads int
+}
+
+func (r *trackingReadCloser) Read(p []byte) (int, error) {
+	r.reads++
+	return r.Reader.Read(p)
+}
+
+func (r *trackingReadCloser) Close() error {
+	return nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
 }
 
 func TestProxyReloadedPolicyAppliesWithoutRestart(t *testing.T) {

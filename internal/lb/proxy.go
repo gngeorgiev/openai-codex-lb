@@ -77,57 +77,20 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"path":   r.URL.Path,
 	})
 
-	if r.URL.Path == "/healthz" {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"ok":true}`)
-		p.logEvent("request.completed", map[string]any{
-			"req_id": reqID,
-			"status": http.StatusOK,
-			"path":   r.URL.Path,
-		})
-		return
-	}
-
-	if r.URL.Path == "/status" {
-		now := time.Now()
-		p.expireCooldowns(now)
-		p.maybeRefreshQuota(r.Context(), now, true)
-		snapshot := p.store.Snapshot()
-		status := BuildProxyStatus(snapshot, now)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(status)
-		p.logEvent("request.completed", map[string]any{
-			"req_id": reqID,
-			"status": http.StatusOK,
-			"path":   r.URL.Path,
-		})
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/admin/") {
-		status := p.handleAdmin(w, r)
+	if isControlPlanePath(r.URL.Path) {
+		if !isLoopbackRequest(r) {
+			http.NotFound(w, r)
+			p.logEvent("request.completed", map[string]any{
+				"req_id": reqID,
+				"status": http.StatusNotFound,
+				"path":   r.URL.Path,
+			})
+			return
+		}
+		status := p.handleControl(w, r)
 		p.logEvent("request.completed", map[string]any{
 			"req_id": reqID,
 			"status": status,
-			"path":   r.URL.Path,
-		})
-		return
-	}
-	if r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"ok":true,"service":"codexlb-proxy"}`)
-		p.logEvent("request.completed", map[string]any{
-			"req_id": reqID,
-			"status": http.StatusOK,
-			"path":   r.URL.Path,
-		})
-		return
-	}
-	if r.URL.Path == "/logs" {
-		p.handleLogs(w, r)
-		p.logEvent("request.completed", map[string]any{
-			"req_id": reqID,
-			"status": http.StatusOK,
 			"path":   r.URL.Path,
 		})
 		return
@@ -142,6 +105,31 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.handleHTTP(w, r, now, reqID)
+}
+
+func (p *ProxyServer) handleControl(w http.ResponseWriter, r *http.Request) int {
+	switch {
+	case r.URL.Path == "/healthz":
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+		return http.StatusOK
+	case r.URL.Path == "/status":
+		now := time.Now()
+		p.expireCooldowns(now)
+		p.maybeRefreshQuota(r.Context(), now, true)
+		snapshot := p.store.Snapshot()
+		status := BuildProxyStatus(snapshot, now)
+		writeJSON(w, http.StatusOK, status)
+		return http.StatusOK
+	case strings.HasPrefix(r.URL.Path, "/admin/"):
+		return p.handleAdmin(w, r)
+	case r.URL.Path == "/logs":
+		p.handleLogs(w, r)
+		return http.StatusOK
+	default:
+		http.NotFound(w, r)
+		return http.StatusNotFound
+	}
 }
 
 func (p *ProxyServer) handleAdmin(w http.ResponseWriter, r *http.Request) int {
@@ -324,15 +312,13 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 }
 
 func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, now time.Time, reqID uint64) {
-	body, err := io.ReadAll(r.Body)
+	snapshot := p.store.Snapshot()
+	maxAttempts := max(1, snapshot.Settings.Proxy.MaxAttempts)
+	body, useBufferedBody, err := prepareRequestBody(r, maxAttempts)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("read request body: %v", err), http.StatusBadRequest)
 		return
 	}
-	_ = r.Body.Close()
-
-	snapshot := p.store.Snapshot()
-	maxAttempts := max(1, snapshot.Settings.Proxy.MaxAttempts)
 
 	var lastResp *http.Response
 	var lastErr error
@@ -367,12 +353,12 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, now tim
 			break
 		}
 
-		upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), bytes.NewReader(body))
+		upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), requestBodyReader(r, body, useBufferedBody, attempt))
 		if err != nil {
 			lastErr = err
 			break
 		}
-		upstreamReq.Header = cloneHeaders(r.Header)
+		upstreamReq.Header = sanitizeForwardHeaders(r.Header)
 		setAccountHeaders(upstreamReq.Header, auth)
 		upstreamReq.Host = targetURL.Host
 
@@ -405,15 +391,21 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, now tim
 			_ = resp.Body.Close()
 			refreshedAuth, refreshed, refreshErr := p.tryRefreshAccountAuth(r.Context(), account, auth)
 			if refreshErr == nil && refreshed {
-				upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), bytes.NewReader(body))
+				if !useBufferedBody {
+					refreshErr = fmt.Errorf("request body is not replayable after auth refresh")
+				} else {
+					upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), bytes.NewReader(body))
+				}
 				if err != nil {
 					lastErr = err
 					break
 				}
-				upstreamReq.Header = cloneHeaders(r.Header)
-				setAccountHeaders(upstreamReq.Header, refreshedAuth)
-				upstreamReq.Host = targetURL.Host
-				resp, err = p.requestClient.Do(upstreamReq)
+				if refreshErr == nil {
+					upstreamReq.Header = sanitizeForwardHeaders(r.Header)
+					setAccountHeaders(upstreamReq.Header, refreshedAuth)
+					upstreamReq.Host = targetURL.Host
+					resp, err = p.requestClient.Do(upstreamReq)
+				}
 				if err != nil {
 					if isCanceledRequest(r.Context(), err) {
 						p.logEvent("request.canceled", map[string]any{
@@ -578,15 +570,11 @@ func (p *ProxyServer) handleWebsocket(w http.ResponseWriter, r *http.Request, no
 	proxy := httputil.NewSingleHostReverseProxy(base)
 	proxy.Transport = p.requestClient.Transport
 	proxy.FlushInterval = -1
-	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = targetURL.Scheme
-		req.URL.Host = targetURL.Host
-		req.URL.Path = targetURL.Path
-		req.URL.RawPath = targetURL.RawPath
-		req.URL.RawQuery = targetURL.RawQuery
-		req.Host = targetURL.Host
-		req.Header = cloneHeaders(r.Header)
-		setAccountHeaders(req.Header, auth)
+	proxy.Rewrite = func(pr *httputil.ProxyRequest) {
+		pr.SetURL(targetURL)
+		pr.Out.Host = targetURL.Host
+		pr.Out.Header = sanitizeForwardHeaders(pr.In.Header)
+		setAccountHeaders(pr.Out.Header, auth)
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		if shouldDisableForAuthFailure(resp.StatusCode, r.URL.Path) {
@@ -1008,9 +996,56 @@ func (p *ProxyServer) logEvent(event string, fields map[string]any) {
 
 func writeResponse(w http.ResponseWriter, resp *http.Response) {
 	defer resp.Body.Close()
-	copyHeaders(w.Header(), resp.Header)
+	copyHeaders(w.Header(), sanitizeResponseHeaders(resp.Header))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func prepareRequestBody(r *http.Request, maxAttempts int) ([]byte, bool, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, false, nil
+	}
+	if shouldBufferRequestBody(r, maxAttempts) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, false, err
+		}
+		_ = r.Body.Close()
+		return body, true, nil
+	}
+	return nil, false, nil
+}
+
+func shouldBufferRequestBody(r *http.Request, maxAttempts int) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	if maxAttempts > 1 {
+		return true
+	}
+	return isAccountScopedPath(r.URL.Path)
+}
+
+func requestBodyReader(r *http.Request, body []byte, buffered bool, attempt int) io.Reader {
+	if buffered {
+		return bytes.NewReader(body)
+	}
+	if attempt == 1 {
+		return r.Body
+	}
+	return nil
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	if host == "" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func cloneHeaders(src http.Header) http.Header {

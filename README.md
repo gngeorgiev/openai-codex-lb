@@ -2,7 +2,7 @@
 
 `codexlb` is a Go load-balancing proxy and wrapper for Codex CLI.
 
-It lets you run Codex through a local proxy that can switch between multiple authenticated accounts, handle failover, and expose live status.
+It lets you run Codex through a local proxy that can switch between multiple authenticated accounts, handle failover, and expose local control/status endpoints.
 
 ## Features
 
@@ -11,6 +11,7 @@ It lets you run Codex through a local proxy that can switch between multiple aut
 - Automatic failover/cooldown on `429` and `5xx`
 - Automatic disable on auth errors (`401`, `403`)
 - Wrapper execution via local proxy (`OPENAI_BASE_URL`)
+- Request forwarding that strips proxy/forwarding hop headers before sending upstream
 - Structured logs under `~/.codex-lb/logs`
 - Tunable runtime config in `~/.codex-lb/config.toml`
 - Config hot reload while proxy is running
@@ -53,6 +54,8 @@ make install PREFIX=$HOME/.local
 ```bash
 ./codexlb proxy --listen 127.0.0.1:8765 --upstream https://chatgpt.com/backend-api
 ```
+
+The forwarding listener is intended for Codex traffic. Local control endpoints such as `/status`, `/logs`, and `/admin/*` are only served to loopback clients.
 
 3. Check state:
 
@@ -346,6 +349,7 @@ When `--proxy-url` is used for account commands, `codexlb` calls these proxy end
 
 Security note:
 
+- Admin and status/log endpoints are intended for local use and are rejected for non-loopback clients on the shared listener.
 - Admin API is currently unauthenticated; expose it only on trusted networks (or behind your own auth/TLS layer).
 - `GET /admin/runtime-auth` returns the selected account's raw `auth.json` payload for runtime bootstrapping; treat it as highly sensitive credential material.
 
@@ -390,7 +394,7 @@ codexlb run -- --json "ping" # pass flags that start with '-'
 
 ### `codexlb status`
 
-Query `GET /status` from proxy.
+Query `GET /status` from the local control plane on the proxy listener.
 
 Default output renders a table with active/pin markers, account identity, health/cooldown state, quota percentages, score, and last-switch metadata.
 
