@@ -581,6 +581,114 @@ func TestProxyRefreshesAccountOn401AndRetries(t *testing.T) {
 	}
 }
 
+func TestProxyMarksTerminalRefreshFailureAndClearsPin(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	oldTokenA := testJWT(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"}})
+	tokenB := testJWT(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-b"}})
+	homeA := filepath.Join(tmp, "acc-a")
+	homeB := filepath.Join(tmp, "acc-b")
+	writeAuthTokensFile(t, homeA, oldTokenA, "refresh-a-dead", "acct-a")
+	writeAuthFile(t, homeB, tokenB, "acct-b")
+
+	authCalls := 0
+	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCalls++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"message":"refresh token already used","code":"refresh_token_reused"}}`)
+	}))
+	defer authSrv.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			if token == oldTokenA {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"error":"unauthorized"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"rate_limit":{"primary_window":{"used_percent":10},"secondary_window":{"used_percent":20}}}`)
+			return
+		case "/backend-api/codex/responses":
+			if token == oldTokenA {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, `{"error":"expired"}`)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+			return
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.UpstreamBaseURL = upstream.URL + "/backend-api"
+		sf.Settings.Proxy.MaxAttempts = 3
+		sf.Settings.Policy.Mode = PolicySticky
+		sf.Accounts = []Account{
+			{ID: "a", Alias: "a", HomeDir: homeA, BaseURL: sf.Settings.Proxy.UpstreamBaseURL, Enabled: true},
+			{ID: "b", Alias: "b", HomeDir: homeB, BaseURL: sf.Settings.Proxy.UpstreamBaseURL, Enabled: true},
+		}
+		sf.State.ActiveIndex = 0
+		sf.State.PinnedAccountID = "a"
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxy := NewProxyServer(store, nil, nil)
+	proxy.authTokenURL = authSrv.URL
+	proxy.authClientID = "client-123"
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	resp, err := http.Post(proxySrv.URL+"/responses", "application/json", bytes.NewBufferString(`{"input":"hi"}`))
+	if err != nil {
+		t.Fatalf("post to proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body=%s", resp.StatusCode, string(body))
+	}
+
+	snap := store.Snapshot()
+	if snap.Accounts[0].Enabled {
+		t.Fatalf("expected account a to be disabled")
+	}
+	if snap.Accounts[0].DisabledReason != "refresh-token-reused" {
+		t.Fatalf("unexpected disable reason: %s", snap.Accounts[0].DisabledReason)
+	}
+	if snap.State.PinnedAccountID != "" {
+		t.Fatalf("expected pinned account to be cleared, got %q", snap.State.PinnedAccountID)
+	}
+	if authCalls != 2 {
+		t.Fatalf("expected request path to attempt auth refresh twice before terminal disable, got %d", authCalls)
+	}
+
+	statusResp, err := http.Get(proxySrv.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	_ = statusResp.Body.Close()
+	if statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", statusResp.StatusCode)
+	}
+	if authCalls != 2 {
+		t.Fatalf("expected terminal refresh failure not to be retried on /status, got %d auth calls", authCalls)
+	}
+}
+
 func TestProxyStatusRefreshesDisabled401Account(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

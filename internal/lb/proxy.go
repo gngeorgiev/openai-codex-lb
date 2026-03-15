@@ -441,7 +441,7 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, now tim
 				}
 			}
 			if refreshErr != nil || shouldDisableForAuthFailure(resp.StatusCode, r.URL.Path) {
-				p.markDisabled(account.ID, fmt.Sprintf("http-%d", resp.StatusCode))
+				p.markDisabled(account.ID, disabledReasonForAuthFailure(resp.StatusCode, refreshErr))
 				lastResp = resp
 				fields := map[string]any{
 					"req_id":     reqID,
@@ -593,7 +593,7 @@ func (p *ProxyServer) handleWebsocket(w http.ResponseWriter, r *http.Request, no
 			if _, refreshed, err := p.tryRefreshAccountAuth(r.Context(), account, auth); err == nil && refreshed {
 				return nil
 			}
-			p.markDisabled(account.ID, fmt.Sprintf("http-%d", resp.StatusCode))
+			p.markDisabled(account.ID, disabledReasonForAuthFailure(resp.StatusCode, nil))
 			p.logEvent("account.disabled", map[string]any{
 				"req_id":     reqID,
 				"status":     resp.StatusCode,
@@ -709,6 +709,9 @@ func (p *ProxyServer) markDisabled(accountID, reason string) {
 		sf.Accounts[idx].Enabled = false
 		sf.Accounts[idx].DisabledReason = reason
 		sf.Accounts[idx].LastSwitchReason = reason
+		if shouldClearPinOnDisable(reason) && sf.State.PinnedAccountID == accountID {
+			sf.State.PinnedAccountID = ""
+		}
 		return nil
 	})
 }
@@ -759,6 +762,9 @@ func (p *ProxyServer) maybeRefreshQuota(ctx context.Context, now time.Time, forc
 			if !force {
 				p.markDisabled(account.ID, "missing-auth")
 			}
+			continue
+		}
+		if isTerminalAuthFailureReason(account.DisabledReason) {
 			continue
 		}
 		if isAuthFailureReason(account.DisabledReason) {
@@ -998,6 +1004,26 @@ func readBodySnippet(r io.Reader, maxBytes int) string {
 
 func isAuthFailureReason(reason string) bool {
 	return reason == "http-401"
+}
+
+func disabledReasonForAuthFailure(statusCode int, refreshErr error) string {
+	if statusCode == http.StatusUnauthorized && isTerminalRefreshError(refreshErr) {
+		return "refresh-token-reused"
+	}
+	return fmt.Sprintf("http-%d", statusCode)
+}
+
+func shouldClearPinOnDisable(reason string) bool {
+	switch reason {
+	case "missing-auth", "http-401", "refresh-token-reused":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTerminalAuthFailureReason(reason string) bool {
+	return reason == "refresh-token-reused"
 }
 
 func (p *ProxyServer) logEvent(event string, fields map[string]any) {

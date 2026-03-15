@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -30,6 +31,20 @@ type oauthTokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	IDToken      string `json:"id_token"`
+}
+
+type authRefreshError struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (e *authRefreshError) Error() string {
+	msg := strings.TrimSpace(e.Message)
+	if msg != "" {
+		return fmt.Sprintf("refresh auth tokens status %d: %s", e.StatusCode, msg)
+	}
+	return fmt.Sprintf("refresh auth tokens status %d", e.StatusCode)
 }
 
 func LoadAuth(homeDir string) (AuthInfo, error) {
@@ -73,10 +88,12 @@ func RefreshAuth(ctx context.Context, client *http.Client, homeDir, tokenURL, cl
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body := readBodySnippet(resp.Body, 1024)
-		if body != "" {
-			return AuthInfo{}, fmt.Errorf("refresh auth tokens status %d: %s", resp.StatusCode, body)
+		refreshErr := &authRefreshError{StatusCode: resp.StatusCode}
+		refreshErr.Code, refreshErr.Message = parseRefreshError(body)
+		if refreshErr.Message == "" {
+			refreshErr.Message = body
 		}
-		return AuthInfo{}, fmt.Errorf("refresh auth tokens status %d", resp.StatusCode)
+		return AuthInfo{}, refreshErr
 	}
 
 	var refreshed oauthTokenResponse
@@ -201,4 +218,34 @@ func nestedString(m map[string]any, keys ...string) string {
 	}
 	v, _ := last[keys[len(keys)-1]].(string)
 	return v
+}
+
+func parseRefreshError(raw string) (code, message string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(payload.Error.Code), strings.TrimSpace(payload.Error.Message)
+}
+
+func isTerminalRefreshError(err error) bool {
+	var refreshErr *authRefreshError
+	if !errors.As(err, &refreshErr) {
+		return false
+	}
+	switch refreshErr.Code {
+	case "refresh_token_reused":
+		return true
+	default:
+		return false
+	}
 }
