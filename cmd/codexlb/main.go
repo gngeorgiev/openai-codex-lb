@@ -69,7 +69,7 @@ Subcommands:
 	}
 
 	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory (default: ~/.codex-lb)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
 	listen := fs.String("listen", "", "Listen address, e.g. 127.0.0.1:8765")
 	upstream := fs.String("upstream", "", "Upstream base URL, e.g. https://chatgpt.com/backend-api")
 	maxAttempts := fs.Int("max-attempts", 0, "Retry attempts per request before returning last upstream response")
@@ -185,8 +185,8 @@ Examples:
 
 func runProxyLogs(argv []string) int {
 	fs := flag.NewFlagSet("proxy logs", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: proxy.proxy_url or http://<listen-from-store>)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Proxy URL (default: $CODEXLB_PROXY_URL, else proxy.proxy_url or http://<listen-from-store>)")
 	tail := fs.Int("tail", 100, "Number of most recent log lines for initial fetch")
 	offset := fs.Int64("offset", -1, "Start reading from byte offset (overrides --tail)")
 	limit := fs.Int("limit", 500, "Maximum lines per request")
@@ -317,8 +317,8 @@ func runAccount(argv []string) int {
 
 func runAccountLogin(argv []string) int {
 	fs := flag.NewFlagSet("account login", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
 	codexBin := fs.String("codex-bin", os.Getenv("CODEXLB_CODEX_BIN"), "Codex executable path")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account login [flags] <alias> [-- <codex-login-args...>]
@@ -376,8 +376,8 @@ Flags:
 
 func runAccountImport(argv []string) int {
 	fs := flag.NewFlagSet("account import", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
 	from := fs.String("from", "", "Existing CODEX_HOME directory to import from")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account import [flags] --from <CODEX_HOME> <alias>
@@ -432,8 +432,8 @@ Flags:
 
 func runAccountList(argv []string) int {
 	fs := flag.NewFlagSet("account list", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account list [flags]
 
@@ -475,8 +475,8 @@ Flags:
 
 func runAccountRemove(argv []string) int {
 	fs := flag.NewFlagSet("account rm", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account rm [flags] <alias>
 
@@ -541,8 +541,8 @@ Flags:
 
 func runPinCommand(argv []string, flagSetName, usage, errPrefix, successFormat string) int {
 	fs := flag.NewFlagSet(flagSetName, flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), usage)
 		fs.PrintDefaults()
@@ -604,8 +604,8 @@ func runPinCommand(argv []string, flagSetName, usage, errPrefix, successFormat s
 
 func runAccountUnpin(argv []string) int {
 	fs := flag.NewFlagSet("account unpin", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Remote proxy admin URL (optional)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account unpin [flags]
 
@@ -665,7 +665,7 @@ func runLoginWith(argv []string) int {
 	}
 
 	fs := flag.NewFlagSet("login-with", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
 	username := fs.String("username", "", "ChatGPT/OpenAI username or email")
 	password := fs.String("password", "", "Password passed directly on the command line")
 	passwordStdin := fs.Bool("password-stdin", false, "Read password from stdin")
@@ -857,8 +857,8 @@ func printAccountList(accounts []lb.Account) {
 
 func runCodex(argv []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: proxy.proxy_url or http://<listen-from-store>)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Proxy URL (default: $CODEXLB_PROXY_URL, else proxy.proxy_url or http://<listen-from-store>)")
 	codexBin := fs.String("codex-bin", os.Getenv("CODEXLB_CODEX_BIN"), "Codex executable path")
 	codexHome := fs.String("codex-home", "", "CODEX_HOME for wrapper-run command")
 	commandOnly := fs.Bool("command", false, "Print wrapped codex command and exit")
@@ -902,8 +902,8 @@ Examples:
 
 func runStatus(argv []string) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
-	root := fs.String("root", "", "State directory")
-	proxyURL := fs.String("proxy-url", "", "Proxy URL (default: proxy.proxy_url or http://<listen-from-store>)")
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Proxy URL (default: $CODEXLB_PROXY_URL, else proxy.proxy_url or http://<listen-from-store>)")
 	timeout := fs.Duration("timeout", 3*time.Second, "HTTP timeout for status request")
 	jsonOut := fs.Bool("json", false, "Print raw JSON status output")
 	shortOut := fs.Bool("short", false, "Print one-line status for status bars")
@@ -1089,6 +1089,14 @@ func noneIfEmpty(v string) string {
 	return v
 }
 
+func defaultRootFlagValue() string {
+	return strings.TrimSpace(os.Getenv("CODEXLB_ROOT"))
+}
+
+func defaultProxyURLFlagValue() string {
+	return strings.TrimSpace(os.Getenv("CODEXLB_PROXY_URL"))
+}
+
 func parseFlagError(err error) int {
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
@@ -1127,6 +1135,8 @@ Commands:
 Run 'codexlb <command> --help' for detailed flags and examples.
 
 Environment:
+  CODEXLB_ROOT       default state directory used by --root
+  CODEXLB_PROXY_URL  default proxy/admin URL used by --proxy-url
   CODEXLB_CODEX_BIN   default codex binary used by account login/run
 `)
 }

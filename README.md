@@ -111,6 +111,11 @@ Optional environment overrides:
 - `CODEXLB_PORT`
 - `UID` / `GID` (container runtime user)
 
+CLI environment overrides:
+
+- `CODEXLB_ROOT` sets the default `--root` for commands that operate on the local store.
+- `CODEXLB_PROXY_URL` sets the default `--proxy-url` for commands that talk to a proxy or remote admin API.
+
 ## Paths
 
 Default root is `~/.codex-lb`.
@@ -251,6 +256,7 @@ Examples:
 ```bash
 codexlb proxy
 codexlb proxy --listen 127.0.0.1:9000 --upstream https://chatgpt.com/backend-api
+CODEXLB_ROOT=/tmp/codexlb codexlb proxy
 ```
 
 ### `codexlb proxy logs`
@@ -267,6 +273,7 @@ Notes:
 
 - Use `--proxy-url` for remote instances.
 - `--follow` polls `/logs` with byte offsets and prints only new lines.
+- `CODEXLB_ROOT` and `CODEXLB_PROXY_URL` provide the default values for `--root` and `--proxy-url`.
 
 ### `codexlb account login`
 
@@ -355,6 +362,17 @@ Notes:
 - By default the command uses the published image `ghcr.io/gngeorgiev/agent-lb-proxy-login:latest`; `--docker-image` overrides it.
 - `--password-stdin` avoids leaking the password into shell history.
 - The automation is designed for username/password sign-in. If OpenAI prompts for CAPTCHA, MFA, or another interactive checkpoint, the containerized flow may still require manual handling.
+
+### CLI Env Vars
+
+For local CLI overrides without repeating flags:
+
+```bash
+export CODEXLB_ROOT=/path/to/state
+export CODEXLB_PROXY_URL=http://127.0.0.1:9000
+```
+
+These act as defaults for `--root` and `--proxy-url`. An explicit flag still wins over the environment.
 
 ### Proxy Admin API
 
