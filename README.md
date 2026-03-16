@@ -297,12 +297,15 @@ Import an existing Codex home auth.
 Usage:
 
 ```bash
-codexlb account import [--root DIR] [--proxy-url URL] --from <CODEX_HOME> <alias>
+codexlb account import [--root DIR] [--proxy-url URL] [--into local|proxy] --from <CODEX_HOME> <alias>
 ```
 
 Notes:
 
-- With `--proxy-url`, the local `auth.json` and optional `config.toml` are uploaded to the proxy.
+- `--from` is always read on the local machine running the CLI.
+- `--into local` imports into the local store under `~/.codex-lb/accounts/<alias>` (or `--root`).
+- `--into proxy` uploads the local `auth.json` and optional `config.toml` to the remote proxy admin API.
+- `--into proxy` requires `--proxy-url`, `CODEXLB_PROXY_URL`, or `proxy.proxy_url`.
 
 ### `codexlb account list`
 

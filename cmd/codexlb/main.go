@@ -379,10 +379,11 @@ func runAccountImport(argv []string) int {
 	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
 	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
 	from := fs.String("from", "", "Existing CODEX_HOME directory to import from")
+	into := fs.String("into", "local", "Import target: local or proxy")
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage: codexlb account import [flags] --from <CODEX_HOME> <alias>
 
-Imports auth.json from an existing Codex home into ~/.codex-lb/accounts/<alias>.
+Imports auth.json from a local existing Codex home into ~/.codex-lb/accounts/<alias> or uploads it to a remote proxy.
 
 Flags:
 `)
@@ -397,8 +398,30 @@ Flags:
 		return 2
 	}
 	alias := args[0]
-	if strings.TrimSpace(*proxyURL) != "" {
-		resp, err := remoteAdminImport(*proxyURL, alias, *from)
+	switch strings.ToLower(strings.TrimSpace(*into)) {
+	case "local":
+	case "proxy":
+	default:
+		fmt.Fprintln(os.Stderr, "account import: --into must be one of: local, proxy")
+		return 2
+	}
+	if strings.EqualFold(strings.TrimSpace(*into), "proxy") {
+		targetProxyURL := strings.TrimSpace(*proxyURL)
+		if targetProxyURL == "" {
+			store, err := lb.OpenStore(*root)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+				return 1
+			}
+			if shouldAutoRemoteAccount(store, *root) {
+				targetProxyURL = strings.TrimSpace(store.Snapshot().Settings.ProxyURL)
+			}
+		}
+		if strings.TrimSpace(targetProxyURL) == "" {
+			fmt.Fprintln(os.Stderr, "account import: --into=proxy requires --proxy-url, $CODEXLB_PROXY_URL, or proxy.proxy_url")
+			return 2
+		}
+		resp, err := remoteAdminImportHome(targetProxyURL, alias, *from)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "import account (remote): %v\n", err)
 			return 1
@@ -411,15 +434,6 @@ Flags:
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
-	}
-	if shouldAutoRemoteAccount(store, *root) {
-		if resp, err := tryRemoteImportWithFallback(store, alias, *from); err == nil {
-			fmt.Printf("imported account %s (total=%d)\n", alias, resp.Total)
-			return 0
-		} else if !isRemoteAdminUnavailable(err) {
-			fmt.Fprintf(os.Stderr, "import account (remote): %v\n", err)
-			return 1
-		}
 	}
 	if err := lb.ImportAccount(store, alias, *from); err != nil {
 		fmt.Fprintf(os.Stderr, "import account: %v\n", err)

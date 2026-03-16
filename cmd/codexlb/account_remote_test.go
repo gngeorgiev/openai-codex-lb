@@ -36,6 +36,17 @@ func TestAccountListRemote(t *testing.T) {
 }
 
 func TestAccountImportRemote(t *testing.T) {
+	source := t.TempDir()
+	auth := `{"tokens":{"access_token":"` + testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-import"},
+	}) + `","account_id":"acct-import"}}`
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(auth), 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "config.toml"), []byte("model = \"gpt-5\"\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/admin/account/import" {
 			http.NotFound(w, r)
@@ -45,15 +56,21 @@ func TestAccountImportRemote(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if req.Alias != "alice" || req.FromHome != "/srv/codex/alice" {
+		if req.Alias != "alice" || req.FromHome != "" {
 			t.Fatalf("unexpected request: %+v", req)
+		}
+		if len(req.Auth) == 0 || !json.Valid(req.Auth) {
+			t.Fatalf("expected auth payload to be uploaded")
+		}
+		if strings.TrimSpace(req.Config) == "" {
+			t.Fatalf("expected config payload to be uploaded")
 		}
 		_ = json.NewEncoder(w).Encode(lb.AdminMutationResponse{OK: true, Total: 2})
 	}))
 	defer server.Close()
 
 	out, code := captureStdout(func() int {
-		return run([]string{"account", "import", "--proxy-url", server.URL, "--from", "/srv/codex/alice", "alice"})
+		return run([]string{"account", "import", "--into", "proxy", "--proxy-url", server.URL, "--from", source, "alice"})
 	})
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d out=%s", code, out)
@@ -239,6 +256,14 @@ func TestAccountLoginDefaultsToConfiguredProxyURL(t *testing.T) {
 }
 
 func TestAccountImportDefaultsToConfiguredProxyURL(t *testing.T) {
+	source := t.TempDir()
+	auth := `{"tokens":{"access_token":"` + testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-import"},
+	}) + `","account_id":"acct-import"}}`
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(auth), 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/admin/account/import" {
@@ -250,7 +275,7 @@ func TestAccountImportDefaultsToConfiguredProxyURL(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if req.Alias != "alice" || req.FromHome != "/srv/codex/alice" {
+		if req.Alias != "alice" || req.FromHome != "" || len(req.Auth) == 0 {
 			t.Fatalf("unexpected request: %+v", req)
 		}
 		_ = json.NewEncoder(w).Encode(lb.AdminMutationResponse{OK: true, Total: 4})
@@ -269,7 +294,7 @@ func TestAccountImportDefaultsToConfiguredProxyURL(t *testing.T) {
 	}
 
 	out, code := captureStdout(func() int {
-		return run([]string{"account", "import", "--root", root, "--from", "/srv/codex/alice", "alice"})
+		return run([]string{"account", "import", "--root", root, "--into", "proxy", "--from", source, "alice"})
 	})
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d out=%s", code, out)
@@ -279,6 +304,71 @@ func TestAccountImportDefaultsToConfiguredProxyURL(t *testing.T) {
 	}
 	if !strings.Contains(out, "imported account alice (total=4)") {
 		t.Fatalf("unexpected output: %q", out)
+	}
+}
+
+func TestAccountImportDefaultsToLocalEvenWhenProxyConfigured(t *testing.T) {
+	source := t.TempDir()
+	auth := `{"tokens":{"access_token":"` + testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-local"},
+	}) + `","account_id":"acct-local"}}`
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(auth), 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	store, err := lb.OpenStore(root)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	cfg := store.Snapshot().Settings
+	cfg.ProxyURL = server.URL
+	if err := lb.WriteSettingsConfig(root, cfg); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	out, code := captureStdout(func() int {
+		return run([]string{"account", "import", "--root", root, "--from", source, "alice"})
+	})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d out=%s", code, out)
+	}
+	if calls != 0 {
+		t.Fatalf("expected no remote calls, got %d", calls)
+	}
+	if !strings.Contains(out, "imported account alice (total=1)") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "accounts", "alice", "auth.json")); err != nil {
+		t.Fatalf("expected local imported auth: %v", err)
+	}
+}
+
+func TestAccountImportIntoProxyRequiresProxyURL(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"tokens":{"access_token":"token"}}`), 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEXLB_ROOT", "")
+	t.Setenv("CODEXLB_PROXY_URL", "")
+
+	errOut, code := captureStderr(func() int {
+		return run([]string{"account", "import", "--into", "proxy", "--from", source, "alice"})
+	})
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d", code)
+	}
+	if !strings.Contains(errOut, "--into=proxy requires") {
+		t.Fatalf("unexpected stderr: %q", errOut)
 	}
 }
 
