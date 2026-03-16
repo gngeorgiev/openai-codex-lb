@@ -91,7 +91,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/status" {
 		now := time.Now()
 		p.expireCooldowns(now)
-		p.maybeRefreshQuota(r.Context(), now, true)
+		p.maybeRefreshQuota(context.WithoutCancel(r.Context()), now, true)
 		snapshot := p.store.Snapshot()
 		status := BuildProxyStatus(snapshot, now)
 		w.Header().Set("Content-Type", "application/json")
