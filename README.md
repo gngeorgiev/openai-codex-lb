@@ -95,6 +95,7 @@ Defaults:
 - Host `~/.codex-lb` is bind-mounted to `/data` in container.
 - Container runs `codexlb proxy --root /data`.
 - Image includes both `codexlb` and the `codex` CLI.
+- Image sets `HOME=/data` so `codex` can store `~/.codex` when running as an arbitrary UID.
 
 Mounted data under `/data` includes:
 
@@ -302,12 +303,14 @@ Import an existing Codex home auth.
 Usage:
 
 ```bash
-codexlb account import [--root DIR] [--proxy-url URL] [--into local|proxy] --from <CODEX_HOME> <alias>
+codexlb account import [--root DIR] [--proxy-url URL] [--into local|proxy] [--from <CODEX_HOME>] [<alias>]
 ```
 
 Notes:
 
 - `--from` is always read on the local machine running the CLI.
+- If `--from` is omitted, defaults to `CODEX_HOME` or `~/.codex`.
+- If `<alias>` is omitted, codexlb derives one from the source `config.toml`/auth when possible, otherwise generates a random alias.
 - `--into local` imports into the local store under `~/.codex-lb/accounts/<alias>` (or `--root`).
 - `--into proxy` uploads the local `auth.json` and optional `config.toml` to the remote proxy admin API.
 - `--into proxy` requires `--proxy-url`, `CODEXLB_PROXY_URL`, or `proxy.proxy_url`.

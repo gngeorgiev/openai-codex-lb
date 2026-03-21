@@ -80,6 +80,65 @@ func TestAccountImportRemote(t *testing.T) {
 	}
 }
 
+func TestAccountImportRemoteDefaultsSourceAndAlias(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	token := testJWT(map[string]any{})
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"tokens":{"access_token":"`+token+`"}}`), 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "config.toml"), []byte("profile = \"remote-work\"\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+
+	listCalls := 0
+	importCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/accounts":
+			listCalls++
+			_ = json.NewEncoder(w).Encode(lb.AdminAccountsResponse{})
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/account/import":
+			importCalls++
+			var req lb.AdminImportRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if req.Alias != "remote-work" || req.FromHome != "" {
+				t.Fatalf("unexpected request: %+v", req)
+			}
+			if len(req.Auth) == 0 || !json.Valid(req.Auth) {
+				t.Fatalf("expected uploaded auth payload")
+			}
+			_ = json.NewEncoder(w).Encode(lb.AdminMutationResponse{OK: true, Total: 2})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	out, code := captureStdout(func() int {
+		return run([]string{"account", "import", "--into", "proxy", "--proxy-url", server.URL})
+	})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d out=%s", code, out)
+	}
+	if listCalls != 1 {
+		t.Fatalf("expected one remote list call, got %d", listCalls)
+	}
+	if importCalls != 1 {
+		t.Fatalf("expected one remote import call, got %d", importCalls)
+	}
+	if !strings.Contains(out, "imported account remote-work (total=2)") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+}
+
 func TestAccountPinRemoteError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/admin/account/pin" {

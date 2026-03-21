@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +15,7 @@ import (
 	neturl "net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -20,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gngeorgiev/openai-codex-lb/internal/lb"
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 func main() {
@@ -378,12 +382,13 @@ func runAccountImport(argv []string) int {
 	fs := flag.NewFlagSet("account import", flag.ContinueOnError)
 	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
 	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Remote proxy admin URL (default: $CODEXLB_PROXY_URL)")
-	from := fs.String("from", "", "Existing CODEX_HOME directory to import from")
+	from := fs.String("from", "", "Existing CODEX_HOME directory to import from (default: $CODEX_HOME or ~/.codex)")
 	into := fs.String("into", "local", "Import target: local or proxy")
 	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), `Usage: codexlb account import [flags] --from <CODEX_HOME> <alias>
+		fmt.Fprint(fs.Output(), `Usage: codexlb account import [flags] [<alias>]
 
 Imports auth.json from a local existing Codex home into ~/.codex-lb/accounts/<alias> or uploads it to a remote proxy.
+If <alias> is omitted, codexlb derives one from the source config/auth when possible, otherwise generates one.
 
 Flags:
 `)
@@ -393,22 +398,47 @@ Flags:
 		return parseFlagError(err)
 	}
 	args := fs.Args()
-	if len(args) != 1 || *from == "" {
+	if len(args) > 1 {
 		fs.Usage()
 		return 2
 	}
-	alias := args[0]
-	switch strings.ToLower(strings.TrimSpace(*into)) {
+	target := strings.ToLower(strings.TrimSpace(*into))
+	switch target {
 	case "local":
 	case "proxy":
 	default:
 		fmt.Fprintln(os.Stderr, "account import: --into must be one of: local, proxy")
 		return 2
 	}
-	if strings.EqualFold(strings.TrimSpace(*into), "proxy") {
+
+	sourceHome, err := resolveAccountImportSourceHome(*from)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "account import: resolve source home: %v\n", err)
+		return 1
+	}
+
+	var store *lb.Store
+	openStore := func() (*lb.Store, error) {
+		if store != nil {
+			return store, nil
+		}
+		st, err := lb.OpenStore(*root)
+		if err != nil {
+			return nil, err
+		}
+		store = st
+		return store, nil
+	}
+
+	alias := ""
+	if len(args) == 1 {
+		alias = args[0]
+	}
+
+	if target == "proxy" {
 		targetProxyURL := strings.TrimSpace(*proxyURL)
 		if targetProxyURL == "" {
-			store, err := lb.OpenStore(*root)
+			store, err := openStore()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 				return 1
@@ -421,7 +451,8 @@ Flags:
 			fmt.Fprintln(os.Stderr, "account import: --into=proxy requires --proxy-url, $CODEXLB_PROXY_URL, or proxy.proxy_url")
 			return 2
 		}
-		resp, err := remoteAdminImportHome(targetProxyURL, alias, *from)
+		alias = resolveImportAlias(alias, sourceHome, remoteImportAliasSet(targetProxyURL))
+		resp, err := remoteAdminImportHome(targetProxyURL, alias, sourceHome)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "import account (remote): %v\n", err)
 			return 1
@@ -430,12 +461,13 @@ Flags:
 		return 0
 	}
 
-	store, err := lb.OpenStore(*root)
+	store, err = openStore()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
 		return 1
 	}
-	if err := lb.ImportAccount(store, alias, *from); err != nil {
+	alias = resolveImportAlias(alias, sourceHome, localImportAliasSet(store))
+	if err := lb.ImportAccount(store, alias, sourceHome); err != nil {
 		fmt.Fprintf(os.Stderr, "import account: %v\n", err)
 		return 1
 	}
@@ -1109,6 +1141,224 @@ func defaultRootFlagValue() string {
 
 func defaultProxyURLFlagValue() string {
 	return strings.TrimSpace(os.Getenv("CODEXLB_PROXY_URL"))
+}
+
+func resolveAccountImportSourceHome(from string) (string, error) {
+	from = strings.TrimSpace(from)
+	if from != "" {
+		return from, nil
+	}
+	return lb.DefaultCodexHome()
+}
+
+func resolveImportAlias(alias, sourceHome string, taken map[string]struct{}) string {
+	alias = strings.TrimSpace(alias)
+	if alias != "" {
+		return alias
+	}
+	base := inferImportAlias(sourceHome)
+	if base == "" {
+		base = randomImportAlias()
+	}
+	return makeUniqueImportAlias(base, taken)
+}
+
+func inferImportAlias(sourceHome string) string {
+	if candidate := importAliasFromConfig(sourceHome); candidate != "" {
+		return candidate
+	}
+	if info, err := lb.LoadAuth(sourceHome); err == nil {
+		if candidate := sanitizeImportAliasCandidate(emailAliasLocalPart(info.UserEmail)); candidate != "" {
+			return candidate
+		}
+		if candidate := sanitizeImportAliasCandidate(info.ChatGPTAccountID); candidate != "" {
+			return candidate
+		}
+	}
+
+	baseName := filepath.Base(filepath.Clean(sourceHome))
+	switch strings.ToLower(strings.Trim(baseName, ".")) {
+	case "", "codex":
+		return randomImportAlias()
+	default:
+		if candidate := sanitizeImportAliasCandidate(baseName); candidate != "" {
+			return candidate
+		}
+	}
+	return randomImportAlias()
+}
+
+func importAliasFromConfig(sourceHome string) string {
+	configPath := filepath.Join(sourceHome, "config.toml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return ""
+	}
+	var config map[string]any
+	if err := toml.Unmarshal(data, &config); err != nil {
+		return ""
+	}
+	return sanitizeImportAliasCandidate(findImportAliasHint(config))
+}
+
+func findImportAliasHint(v any) string {
+	switch node := v.(type) {
+	case map[string]any:
+		for _, key := range []string{"alias", "profile"} {
+			if value, ok := node[key].(string); ok && strings.TrimSpace(value) != "" {
+				return value
+			}
+		}
+		for _, child := range node {
+			if hint := findImportAliasHint(child); hint != "" {
+				return hint
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if hint := findImportAliasHint(child); hint != "" {
+				return hint
+			}
+		}
+	}
+	return ""
+}
+
+func emailAliasLocalPart(email string) string {
+	email = strings.TrimSpace(email)
+	if idx := strings.IndexByte(email, '@'); idx >= 0 {
+		email = email[:idx]
+	}
+	return email
+}
+
+func sanitizeImportAliasCandidate(raw string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	lastSeparator := false
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			if b.Len() == 0 && !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+				continue
+			}
+			b.WriteRune(r)
+			lastSeparator = false
+		default:
+			if b.Len() == 0 || lastSeparator {
+				continue
+			}
+			b.WriteByte('-')
+			lastSeparator = true
+		}
+	}
+
+	out := strings.Trim(b.String(), "._-")
+	if out == "" {
+		return ""
+	}
+	if len(out) > 64 {
+		out = strings.TrimRight(out[:64], "._-")
+	}
+	if out == "" {
+		return ""
+	}
+	first := out[0]
+	if (first < 'a' || first > 'z') && (first < '0' || first > '9') {
+		return ""
+	}
+	return out
+}
+
+func localImportAliasSet(store *lb.Store) map[string]struct{} {
+	taken := map[string]struct{}{}
+	for _, account := range store.Snapshot().Accounts {
+		if alias := strings.ToLower(strings.TrimSpace(account.Alias)); alias != "" {
+			taken[alias] = struct{}{}
+		}
+	}
+	return taken
+}
+
+func remoteImportAliasSet(proxyURL string) map[string]struct{} {
+	accounts, err := remoteAdminListAccountsWithClient(remoteAdminFallbackClient(), proxyURL)
+	if err != nil {
+		return nil
+	}
+	taken := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		if alias := strings.ToLower(strings.TrimSpace(account.Alias)); alias != "" {
+			taken[alias] = struct{}{}
+		}
+	}
+	return taken
+}
+
+func makeUniqueImportAlias(base string, taken map[string]struct{}) string {
+	base = sanitizeImportAliasCandidate(base)
+	if base == "" {
+		base = randomImportAlias()
+	}
+	if !importAliasTaken(base, taken) {
+		return base
+	}
+	for i := 2; i < 1000; i++ {
+		candidate := appendImportAliasSuffix(base, strconv.Itoa(i))
+		if !importAliasTaken(candidate, taken) {
+			return candidate
+		}
+	}
+	for {
+		candidate := appendImportAliasSuffix(base, randomImportAliasSuffix())
+		if !importAliasTaken(candidate, taken) {
+			return candidate
+		}
+	}
+}
+
+func appendImportAliasSuffix(base, suffix string) string {
+	suffix = sanitizeImportAliasCandidate(suffix)
+	if suffix == "" {
+		suffix = randomImportAliasSuffix()
+	}
+	if base == "" {
+		base = "import"
+	}
+	maxBaseLen := 64 - len(suffix) - 1
+	if maxBaseLen < 1 {
+		return randomImportAlias()
+	}
+	if len(base) > maxBaseLen {
+		base = strings.TrimRight(base[:maxBaseLen], "._-")
+	}
+	if base == "" {
+		base = "import"
+	}
+	return base + "-" + suffix
+}
+
+func importAliasTaken(alias string, taken map[string]struct{}) bool {
+	if len(taken) == 0 {
+		return false
+	}
+	_, ok := taken[strings.ToLower(alias)]
+	return ok
+}
+
+func randomImportAlias() string {
+	return "import-" + randomImportAliasSuffix()
+}
+
+func randomImportAliasSuffix() string {
+	buf := make([]byte, 4)
+	if _, err := rand.Read(buf); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(buf)
 }
 
 func parseFlagError(err error) int {

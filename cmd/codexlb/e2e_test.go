@@ -133,6 +133,68 @@ func TestE2EAccountImport(t *testing.T) {
 	}
 }
 
+func TestE2EAccountImportDefaultsSourceAndAliasFromConfig(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	source := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	token := testJWT(map[string]any{})
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"tokens":{"access_token":"`+token+`"}}`), 0o600); err != nil {
+		t.Fatalf("write source auth: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "config.toml"), []byte("profile = \"work\"\n"), 0o600); err != nil {
+		t.Fatalf("write source config: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+
+	out, code := captureStdout(func() int {
+		return run([]string{"account", "import", "--root", root})
+	})
+	if code != 0 {
+		t.Fatalf("account import failed: %d out=%s", code, out)
+	}
+	if !strings.Contains(out, "imported account work (total=1)") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "accounts", "work", "auth.json")); err != nil {
+		t.Fatalf("expected imported auth: %v", err)
+	}
+}
+
+func TestE2EAccountImportAssignsRandomAliasWhenNoHintAvailable(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	source := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	token := testJWT(map[string]any{})
+	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"tokens":{"access_token":"`+token+`"}}`), 0o600); err != nil {
+		t.Fatalf("write source auth: %v", err)
+	}
+
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+
+	out, code := captureStdout(func() int {
+		return run([]string{"account", "import", "--root", root})
+	})
+	if code != 0 {
+		t.Fatalf("account import failed: %d out=%s", code, out)
+	}
+	alias := importedAccountAlias(t, out)
+	if !strings.HasPrefix(alias, "import-") {
+		t.Fatalf("expected random import alias, got %q output=%q", alias, out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "accounts", alias, "auth.json")); err != nil {
+		t.Fatalf("expected imported auth for %s: %v", alias, err)
+	}
+}
+
 func TestRunCommandOnlyPrintsWrappedCommand(t *testing.T) {
 	root := t.TempDir()
 	fakeLog := filepath.Join(root, "fake-codex.log")
@@ -423,4 +485,19 @@ func testJWT(payload map[string]any) string {
 	b, _ := json.Marshal(payload)
 	body := base64.RawURLEncoding.EncodeToString(b)
 	return head + "." + body + ".sig"
+}
+
+func importedAccountAlias(t *testing.T, out string) string {
+	t.Helper()
+	line := strings.TrimSpace(out)
+	const prefix = "imported account "
+	if !strings.HasPrefix(line, prefix) {
+		t.Fatalf("missing imported account prefix: %q", out)
+	}
+	rest := strings.TrimPrefix(line, prefix)
+	idx := strings.IndexByte(rest, ' ')
+	if idx <= 0 {
+		t.Fatalf("could not parse imported alias from %q", out)
+	}
+	return rest[:idx]
 }

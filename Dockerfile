@@ -23,11 +23,17 @@ RUN set -eux; \
 FROM alpine:3.21
 
 ARG CODEX_NPM_VERSION=latest
+ENV HOME=/data
+
+RUN mkdir -p /data \
+	&& chmod 0777 /data
 
 RUN apk add --no-cache ca-certificates nodejs npm \
 	&& npm install -g "@openai/codex@${CODEX_NPM_VERSION}"
 
 COPY --from=builder /out/codexlb /usr/local/bin/codexlb
+
+WORKDIR /data
 
 ENTRYPOINT ["/usr/local/bin/codexlb"]
 CMD ["proxy", "--root", "/data", "--listen", "0.0.0.0:8765", "--upstream", "https://chatgpt.com/backend-api"]
