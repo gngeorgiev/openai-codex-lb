@@ -1058,11 +1058,10 @@ func printStatusShort(status lb.ProxyStatus) {
 		}
 	}
 	if active == "none" {
-		for _, child := range status.ChildProxies {
-			if child.Active {
-				active = child.Name
-				break
-			}
+		if status.SelectedProxyName != "" {
+			active = status.SelectedProxyName
+		} else if status.SelectedProxyURL != "" {
+			active = status.SelectedProxyURL
 		}
 	}
 	reason := noneIfEmpty(status.SelectionReason)
@@ -1137,12 +1136,8 @@ func printStatusTable(status lb.ProxyStatus) {
 
 	fmt.Println()
 	childWriter := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(childWriter, "ACTIVE\tNAME\tURL\tSTATUS\tSCORE\tSELECTED\tREASON\tLAST_SWITCH\tERROR")
+	_, _ = fmt.Fprintln(childWriter, "NAME\tURL\tSTATUS\tSCORE\tSELECTED\tREASON\tLAST_SWITCH\tERROR")
 	for _, child := range status.ChildProxies {
-		active := ""
-		if child.Active {
-			active = "*"
-		}
 		state := "ready"
 		if !child.Reachable {
 			state = "unreachable"
@@ -1151,8 +1146,7 @@ func printStatusTable(status lb.ProxyStatus) {
 		} else if !child.Healthy {
 			state = "unhealthy"
 		}
-		_, _ = fmt.Fprintf(childWriter, "%s\t%s\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\n",
-			active,
+		_, _ = fmt.Fprintf(childWriter, "%s\t%s\t%s\t%.3f\t%s\t%s\t%s\t%s\n",
 			noneIfEmpty(child.Name),
 			child.URL,
 			state,

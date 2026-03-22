@@ -325,7 +325,9 @@ func (p *ProxyServer) buildStatus(ctx context.Context, snapshot StoreFile, now t
 	}
 	status.SelectedAccountID = ""
 	status.SelectionReason = ""
-	status.Accounts = nil
+	for i := range status.Accounts {
+		status.Accounts[i].Active = false
+	}
 
 	targets := p.cachedChildProxyTargets(snapshot, now)
 	if refreshChildProxies {

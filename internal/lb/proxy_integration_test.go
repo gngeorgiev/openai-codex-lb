@@ -1064,10 +1064,14 @@ func TestProxyRoutesViaChildProxyByUsage(t *testing.T) {
 	defer childB.Close()
 
 	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.Name = "edge-main"
 		sf.Settings.Policy.Mode = PolicyUsageBalanced
 		sf.Settings.Proxy.MaxAttempts = 2
 		sf.Settings.Proxy.ChildProxyURLs = []string{childA.URL, childB.URL}
-		sf.Accounts = nil
+		sf.Accounts = []Account{
+			{ID: "local-a", Alias: "local-a", Enabled: true, Quota: QuotaState{DailyLimit: 100, DailyUsed: 10, WeeklyLimit: 100, WeeklyUsed: 10, Source: "manual"}},
+			{ID: "local-b", Alias: "local-b", Enabled: true, Quota: QuotaState{DailyLimit: 100, DailyUsed: 20, WeeklyLimit: 100, WeeklyUsed: 20, Source: "manual"}},
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("store update: %v", err)
@@ -1105,6 +1109,7 @@ func TestProxyRoutesViaChildProxyByUsage(t *testing.T) {
 		t.Fatalf("expected selected proxy name child-b, got %q", status.SelectedProxyName)
 	}
 	found := false
+	foundLocal := false
 	activeCount := 0
 	for _, account := range status.Accounts {
 		if account.Active {
@@ -1113,9 +1118,15 @@ func TestProxyRoutesViaChildProxyByUsage(t *testing.T) {
 		if account.ID == "b" && account.ProxyName == "child-b" {
 			found = true
 		}
+		if account.ID == "local-a" && account.ProxyName == "edge-main" && !account.Active {
+			foundLocal = true
+		}
 	}
 	if !found {
 		t.Fatalf("expected aggregated account from child-b, got %+v", status.Accounts)
+	}
+	if !foundLocal {
+		t.Fatalf("expected local parent account to remain visible but inactive, got %+v", status.Accounts)
 	}
 	if activeCount != 1 {
 		t.Fatalf("expected exactly one active account on selected route, got %+v", status.Accounts)
