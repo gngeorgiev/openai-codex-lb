@@ -462,6 +462,7 @@ codexlb run -- --json "ping" # pass flags that start with '-'
 Query `GET /status` from proxy.
 
 Default output renders a table with active/pin markers, account identity, health/cooldown state, quota percentages, score, and last-switch metadata.
+The proxy serves cached status immediately and refreshes quota and child-proxy data in the background, so `codexlb status` does not block on slow upstream health checks.
 
 Usage:
 

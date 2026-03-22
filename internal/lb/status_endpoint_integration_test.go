@@ -98,10 +98,15 @@ func TestProxyStatusEndpointForceRefreshesQuotaEvenWhenNotDue(t *testing.T) {
 	home := filepath.Join(root, "acc-f")
 	writeAuthFile(t, home, token, "acct-f")
 
-	usageCalls := 0
+	usageStarted := make(chan struct{}, 1)
+	releaseUsage := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/backend-api/wham/usage" {
-			usageCalls++
+			select {
+			case usageStarted <- struct{}{}:
+			default:
+			}
+			<-releaseUsage
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":12},"secondary_window":{"used_percent":34}}}`))
 			return
@@ -142,7 +147,17 @@ func TestProxyStatusEndpointForceRefreshesQuotaEvenWhenNotDue(t *testing.T) {
 	srv := httptest.NewServer(NewProxyServer(store, nil, nil))
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/status")
+	done := make(chan struct{})
+	var resp *http.Response
+	go func() {
+		resp, err = http.Get(srv.URL + "/status")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("expected /status to return before quota refresh completed")
+	}
 	if err != nil {
 		t.Fatalf("GET /status: %v", err)
 	}
@@ -150,13 +165,17 @@ func TestProxyStatusEndpointForceRefreshesQuotaEvenWhenNotDue(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	if usageCalls == 0 {
-		t.Fatalf("expected /status to force a quota refresh call")
+	select {
+	case <-usageStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected /status to trigger a quota refresh call")
 	}
+	close(releaseUsage)
 
-	snap := store.Snapshot()
-	if snap.Accounts[0].Quota.Source != "openai_usage_api" {
-		t.Fatalf("expected quota source to be refreshed, got %q", snap.Accounts[0].Quota.Source)
+	if !waitFor(t, 2*time.Second, 20*time.Millisecond, func() bool {
+		return store.Snapshot().Accounts[0].Quota.Source == "openai_usage_api"
+	}) {
+		t.Fatalf("expected quota source to be refreshed")
 	}
 }
 
@@ -224,6 +243,12 @@ func TestProxyStatusEndpointAutoRecoversDisabledAccount(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
+	if !waitFor(t, 2*time.Second, 20*time.Millisecond, func() bool {
+		return store.Snapshot().Accounts[0].Enabled
+	}) {
+		t.Fatalf("expected account to auto-recover and be enabled")
+	}
+
 	snap := store.Snapshot()
 	if !snap.Accounts[0].Enabled {
 		t.Fatalf("expected account to auto-recover and be enabled")
@@ -248,9 +273,15 @@ func TestProxyStatusEndpointRefreshesQuotaWhenRequestContextIsCanceled(t *testin
 	home := filepath.Join(root, "acc-c")
 	writeAuthFile(t, home, token, "acct-c")
 
+	usageStarted := make(chan struct{}, 1)
+	releaseUsage := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/backend-api/wham/usage" {
-			time.Sleep(25 * time.Millisecond)
+			select {
+			case usageStarted <- struct{}{}:
+			default:
+			}
+			<-releaseUsage
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":7},"secondary_window":{"used_percent":11}}}`))
 			return
@@ -296,14 +327,120 @@ func TestProxyStatusEndpointRefreshesQuotaWhenRequestContextIsCanceled(t *testin
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 
-	snap := store.Snapshot()
-	if snap.Accounts[0].Quota.Source != "openai_usage_api" {
-		t.Fatalf("expected quota source to be refreshed, got %q", snap.Accounts[0].Quota.Source)
+	select {
+	case <-usageStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected canceled /status request to still start a quota refresh")
 	}
-	if snap.Accounts[0].Quota.DailyUsed != 7 {
-		t.Fatalf("expected daily used to be refreshed, got %v", snap.Accounts[0].Quota.DailyUsed)
+	close(releaseUsage)
+
+	if !waitFor(t, 2*time.Second, 20*time.Millisecond, func() bool {
+		snap := store.Snapshot()
+		return snap.Accounts[0].Quota.Source == "openai_usage_api" &&
+			snap.Accounts[0].Quota.DailyUsed == 7 &&
+			snap.Accounts[0].Quota.WeeklyUsed == 11
+	}) {
+		snap := store.Snapshot()
+		t.Fatalf("expected quota refresh to complete after canceled request, got %+v", snap.Accounts[0].Quota)
 	}
-	if snap.Accounts[0].Quota.WeeklyUsed != 11 {
-		t.Fatalf("expected weekly used to be refreshed, got %v", snap.Accounts[0].Quota.WeeklyUsed)
+}
+
+func TestProxyStatusEndpointUsesCachedChildProxyStatusWhenRefreshIsSlow(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	delayRefresh := make(chan struct{}, 1)
+	refreshStarted := make(chan struct{}, 1)
+	releaseRefresh := make(chan struct{})
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/status" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		select {
+		case <-delayRefresh:
+			select {
+			case refreshStarted <- struct{}{}:
+			default:
+			}
+			<-releaseRefresh
+		default:
+		}
+		_ = json.NewEncoder(w).Encode(ProxyStatus{
+			ProxyName:       "child-a",
+			GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
+			SelectionReason: "usage-stay",
+			Accounts: []AccountStatus{
+				{ProxyName: "child-a", Alias: "a", ID: "a", Active: true, Healthy: true, Enabled: true, Score: 0.9},
+			},
+		})
+	}))
+	defer child.Close()
+	defer close(releaseRefresh)
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.Name = "main"
+		sf.Settings.Policy.Mode = PolicyUsageBalanced
+		sf.Settings.Proxy.ChildProxyURLs = []string{child.URL}
+		sf.Accounts = nil
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxy := NewProxyServer(store, nil, nil)
+	now := time.Now()
+	snapshot := store.Snapshot()
+	sel, target, err := proxy.selectChildProxy(context.Background(), snapshot, now, true)
+	if err != nil {
+		t.Fatalf("warm child proxy status: %v", err)
+	}
+	proxy.markChildProxySuccess(sel, target.URL, now)
+
+	delayRefresh <- struct{}{}
+	srv := httptest.NewServer(proxy)
+	defer srv.Close()
+
+	done := make(chan struct{})
+	var resp *http.Response
+	go func() {
+		resp, err = http.Get(srv.URL + "/status")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("expected /status to return before child proxy refresh completed")
+	}
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var status ProxyStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status.SelectedProxyURL != child.URL {
+		t.Fatalf("expected selected proxy %q, got %q", child.URL, status.SelectedProxyURL)
+	}
+	if status.SelectedProxyName != "child-a" {
+		t.Fatalf("expected selected proxy name child-a, got %q", status.SelectedProxyName)
+	}
+	if len(status.Accounts) != 1 || status.Accounts[0].ID != "a" || !status.Accounts[0].Active {
+		t.Fatalf("expected cached child account to stay visible, got %+v", status.Accounts)
+	}
+
+	select {
+	case <-refreshStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected /status to refresh child proxy status in the background")
 	}
 }

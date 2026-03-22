@@ -66,59 +66,11 @@ func (p *ProxyServer) selectChildProxy(ctx context.Context, snapshot StoreFile, 
 	if len(targets) == 0 {
 		return Selection{}, childProxyTarget{}, fmt.Errorf("no child proxies configured")
 	}
-
-	p.childProxyMu.Lock()
-	activeURL := p.childProxyActiveURL
-	p.childProxyMu.Unlock()
-
-	activeIndex := 0
-	fakeAccounts := make([]Account, 0, len(targets))
-	nowMS := now.UnixMilli()
-	for i, target := range targets {
-		if target.URL == activeURL {
-			activeIndex = i
-		}
-		cooldownUntil := target.CooldownUntilMS
-		if !target.Reachable || !target.Healthy {
-			if cooldownUntil <= nowMS {
-				cooldownUntil = nowMS + 1
-			}
-		}
-		remaining := clamp01(target.Score) * 100
-		fakeAccounts = append(fakeAccounts, Account{
-			ID:               target.URL,
-			Alias:            target.URL,
-			Enabled:          true,
-			CooldownUntilMS:  cooldownUntil,
-			LastUsedAtMS:     target.LastUsedAtMS,
-			LastSwitchReason: target.LastSwitchReason,
-			Quota: QuotaState{
-				DailyLimit:  100,
-				DailyUsed:   100 - remaining,
-				WeeklyLimit: 100,
-				WeeklyUsed:  100 - remaining,
-				Source:      "child_proxy",
-			},
-		})
+	sel, target, ok := p.selectChildProxyFromTargets(snapshot, now, targets)
+	if !ok {
+		return Selection{}, childProxyTarget{}, fmt.Errorf("no healthy child proxies")
 	}
-
-	fake := StoreFile{
-		Settings: Settings{
-			Policy: snapshot.Settings.Policy,
-		},
-		State: RuntimeState{
-			ActiveIndex: activeIndex,
-		},
-		Accounts: fakeAccounts,
-	}
-	sel, err := selectAccount(&fake, nowMS)
-	if err != nil {
-		return Selection{}, childProxyTarget{}, err
-	}
-	if sel.Index < 0 || sel.Index >= len(targets) {
-		return Selection{}, childProxyTarget{}, fmt.Errorf("invalid selected child proxy index")
-	}
-	return sel, targets[sel.Index], nil
+	return sel, target, nil
 }
 
 func (p *ProxyServer) childProxyTargets(ctx context.Context, snapshot StoreFile, now time.Time, forceRefresh bool) []childProxyTarget {
@@ -143,15 +95,7 @@ func (p *ProxyServer) childProxyTargets(ctx context.Context, snapshot StoreFile,
 	for idx, proxyURL := range urls {
 		state := states[proxyURL]
 		go func(idx int, proxyURL string, state childProxyRuntime) {
-			target := childProxyTarget{
-				URL:              proxyURL,
-				Active:           proxyURL == activeURL,
-				CooldownUntilMS:  state.CooldownUntilMS,
-				LastUsedAtMS:     state.LastUsedAtMS,
-				LastSwitchReason: state.LastSwitchReason,
-				LastError:        state.LastError,
-				Reachable:        state.Reachable,
-			}
+			target := childProxyTargetFromState(proxyURL, activeURL, state)
 
 			status, err := p.fetchChildProxyStatus(ctx, proxyURL, forceRefresh)
 			if err != nil {
@@ -161,24 +105,7 @@ func (p *ProxyServer) childProxyTargets(ctx context.Context, snapshot StoreFile,
 				ch <- result{idx: idx, target: target}
 				return
 			}
-
-			summary, ok := summarizeProxyCapacity(status)
-			target.Name = strings.TrimSpace(status.ProxyName)
-			target.Accounts = append([]AccountStatus(nil), status.Accounts...)
-			target.Reachable = true
-			target.SelectionReason = status.SelectionReason
-			target.SelectedTarget = status.SelectedAccountID
-			if target.SelectedTarget == "" {
-				target.SelectedTarget = status.SelectedProxyURL
-			}
-			if ok {
-				target.Score = summary.Score
-				target.Healthy = target.CooldownUntilMS <= now.UnixMilli()
-			}
-			if !ok {
-				target.Healthy = false
-				target.LastError = "child proxy has no healthy targets"
-			}
+			target = applyChildProxyStatus(target, status, now)
 			ch <- result{idx: idx, target: target}
 		}(idx, proxyURL, state)
 	}
@@ -189,6 +116,39 @@ func (p *ProxyServer) childProxyTargets(ctx context.Context, snapshot StoreFile,
 		out[res.idx] = res.target
 	}
 	return out
+}
+
+func childProxyTargetFromState(proxyURL, activeURL string, state childProxyRuntime) childProxyTarget {
+	return childProxyTarget{
+		URL:              proxyURL,
+		Active:           proxyURL == activeURL,
+		CooldownUntilMS:  state.CooldownUntilMS,
+		LastUsedAtMS:     state.LastUsedAtMS,
+		LastSwitchReason: state.LastSwitchReason,
+		LastError:        state.LastError,
+		Reachable:        state.Reachable,
+	}
+}
+
+func applyChildProxyStatus(target childProxyTarget, status ProxyStatus, now time.Time) childProxyTarget {
+	summary, ok := summarizeProxyCapacity(status)
+	target.Name = strings.TrimSpace(status.ProxyName)
+	target.Accounts = append([]AccountStatus(nil), status.Accounts...)
+	target.Reachable = true
+	target.SelectionReason = status.SelectionReason
+	target.SelectedTarget = status.SelectedAccountID
+	if target.SelectedTarget == "" {
+		target.SelectedTarget = status.SelectedProxyURL
+	}
+	if ok {
+		target.Score = summary.Score
+		target.Healthy = target.CooldownUntilMS <= now.UnixMilli()
+		target.LastError = ""
+		return target
+	}
+	target.Healthy = false
+	target.LastError = "child proxy has no healthy targets"
+	return target
 }
 
 func (p *ProxyServer) fetchChildProxyStatus(ctx context.Context, proxyURL string, forceRefresh bool) (ProxyStatus, error) {
@@ -210,7 +170,7 @@ func (p *ProxyServer) fetchChildProxyStatus(ctx context.Context, proxyURL string
 		reqCtx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(proxyURL, "/")+"/status", nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(proxyURL, "/")+"/status?refresh=1", nil)
 	if err != nil {
 		return ProxyStatus{}, err
 	}
@@ -358,33 +318,133 @@ func rewriteForChildProxy(src *url.URL, proxyURL string) (*url.URL, error) {
 	return &next, nil
 }
 
-func (p *ProxyServer) buildStatus(ctx context.Context, snapshot StoreFile, now time.Time) ProxyStatus {
+func (p *ProxyServer) buildStatus(ctx context.Context, snapshot StoreFile, now time.Time, refreshChildProxies bool) ProxyStatus {
 	status := BuildProxyStatus(snapshot, now)
 	if !hasChildProxyRouting(snapshot) {
 		return status
 	}
 	status.SelectedAccountID = ""
 	status.SelectionReason = ""
+	status.Accounts = nil
 
-	targets := p.childProxyTargets(ctx, snapshot, now, true)
+	targets := p.cachedChildProxyTargets(snapshot, now)
+	if refreshChildProxies {
+		targets = p.childProxyTargets(ctx, snapshot, now, true)
+	}
+	sel, selectedTarget, hasSelected := p.selectChildProxyFromTargets(snapshot, now, targets)
 	status.ChildProxies = make([]ChildProxyStatus, 0, len(targets))
 	for _, target := range targets {
 		for _, account := range target.Accounts {
 			if strings.TrimSpace(account.ProxyName) == "" {
 				account.ProxyName = target.Name
 			}
+			if !hasSelected || target.URL != selectedTarget.URL {
+				account.Active = false
+			}
 			status.Accounts = append(status.Accounts, account)
 		}
 		status.ChildProxies = append(status.ChildProxies, childProxyStatusView(target, now))
 	}
 	sortAccountStatuses(status.Accounts)
-	if sel, target, err := p.selectChildProxy(ctx, snapshot, now, false); err == nil {
-		status.SelectedProxyURL = target.URL
+	if hasSelected {
+		status.SelectedProxyURL = selectedTarget.URL
+		status.SelectedProxyName = selectedTarget.Name
 		if status.SelectionReason == "" {
 			status.SelectionReason = sel.SwitchReason
 		}
 	}
 	return status
+}
+
+func (p *ProxyServer) cachedChildProxyTargets(snapshot StoreFile, now time.Time) []childProxyTarget {
+	urls := snapshot.Settings.Proxy.ChildProxyURLs
+	if len(urls) == 0 {
+		return nil
+	}
+
+	p.childProxyMu.Lock()
+	activeURL := p.childProxyActiveURL
+	states := make(map[string]childProxyRuntime, len(p.childProxyStates))
+	for url, state := range p.childProxyStates {
+		states[url] = state
+	}
+	p.childProxyMu.Unlock()
+
+	out := make([]childProxyTarget, 0, len(urls))
+	for _, proxyURL := range urls {
+		state := states[proxyURL]
+		target := childProxyTargetFromState(proxyURL, activeURL, state)
+		if state.Reachable && !state.StatusFetchedAt.IsZero() {
+			target = applyChildProxyStatus(target, state.Status, now)
+		}
+		out = append(out, target)
+	}
+	return out
+}
+
+func (p *ProxyServer) refreshChildProxyStatusCache(snapshot StoreFile, now time.Time) {
+	if !p.childProxyRefreshInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	defer p.childProxyRefreshInFlight.Store(false)
+
+	_ = p.childProxyTargets(context.Background(), snapshot, now, true)
+}
+
+func (p *ProxyServer) selectChildProxyFromTargets(snapshot StoreFile, now time.Time, targets []childProxyTarget) (Selection, childProxyTarget, bool) {
+	if len(targets) == 0 {
+		return Selection{}, childProxyTarget{}, false
+	}
+
+	p.childProxyMu.Lock()
+	activeURL := p.childProxyActiveURL
+	p.childProxyMu.Unlock()
+
+	activeIndex := 0
+	fakeAccounts := make([]Account, 0, len(targets))
+	nowMS := now.UnixMilli()
+	for i, target := range targets {
+		if target.URL == activeURL {
+			activeIndex = i
+		}
+		cooldownUntil := target.CooldownUntilMS
+		if !target.Reachable || !target.Healthy {
+			if cooldownUntil <= nowMS {
+				cooldownUntil = nowMS + 1
+			}
+		}
+		remaining := clamp01(target.Score) * 100
+		fakeAccounts = append(fakeAccounts, Account{
+			ID:               target.URL,
+			Alias:            target.URL,
+			Enabled:          true,
+			CooldownUntilMS:  cooldownUntil,
+			LastUsedAtMS:     target.LastUsedAtMS,
+			LastSwitchReason: target.LastSwitchReason,
+			Quota: QuotaState{
+				DailyLimit:  100,
+				DailyUsed:   100 - remaining,
+				WeeklyLimit: 100,
+				WeeklyUsed:  100 - remaining,
+				Source:      "child_proxy",
+			},
+		})
+	}
+
+	fake := StoreFile{
+		Settings: Settings{
+			Policy: snapshot.Settings.Policy,
+		},
+		State: RuntimeState{
+			ActiveIndex: activeIndex,
+		},
+		Accounts: fakeAccounts,
+	}
+	sel, err := selectAccount(&fake, nowMS)
+	if err != nil || sel.Index < 0 || sel.Index >= len(targets) {
+		return Selection{}, childProxyTarget{}, false
+	}
+	return sel, targets[sel.Index], true
 }
 
 func (p *ProxyServer) handleHTTPViaChildProxies(w http.ResponseWriter, r *http.Request, body []byte, snapshot StoreFile, now time.Time, reqID uint64) {

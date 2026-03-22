@@ -35,8 +35,9 @@ type ProxyServer struct {
 	authTokenURL  string
 	authClientID  string
 
-	refreshInFlight atomic.Bool
-	requestSeq      atomic.Uint64
+	refreshInFlight           atomic.Bool
+	requestSeq                atomic.Uint64
+	childProxyRefreshInFlight atomic.Bool
 
 	childProxyMu        sync.Mutex
 	childProxyStates    map[string]childProxyRuntime
@@ -97,9 +98,15 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		p.expireCooldowns(now)
 		p.expireChildProxyCooldowns(now)
-		p.maybeRefreshQuota(context.WithoutCancel(r.Context()), now, true)
+		forceRefresh := r.URL.Query().Get("refresh") == "1"
+		if forceRefresh {
+			p.maybeRefreshQuota(context.WithoutCancel(r.Context()), now, true)
+		}
 		snapshot := p.store.Snapshot()
-		status := p.buildStatus(context.WithoutCancel(r.Context()), snapshot, now)
+		if !forceRefresh {
+			p.triggerStatusRefresh(snapshot, now)
+		}
+		status := p.buildStatus(context.WithoutCancel(r.Context()), snapshot, now, forceRefresh)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(status)
@@ -317,6 +324,14 @@ func (p *ProxyServer) handleAdmin(w http.ResponseWriter, r *http.Request) int {
 		writeJSONError(w, http.StatusNotFound, "admin endpoint not found")
 		return http.StatusNotFound
 	}
+}
+
+func (p *ProxyServer) triggerStatusRefresh(snapshot StoreFile, now time.Time) {
+	go p.maybeRefreshQuota(context.Background(), now, true)
+	if !hasChildProxyRouting(snapshot) {
+		return
+	}
+	go p.refreshChildProxyStatusCache(snapshot, now)
 }
 
 func decodeJSONBody(r *http.Request, dst any) error {

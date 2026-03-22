@@ -12,6 +12,7 @@ type ProxyStatus struct {
 	State             RuntimeState       `json:"state"`
 	SelectedAccountID string             `json:"selected_account_id,omitempty"`
 	SelectedProxyURL  string             `json:"selected_proxy_url,omitempty"`
+	SelectedProxyName string             `json:"selected_proxy_name,omitempty"`
 	SelectionReason   string             `json:"selection_reason,omitempty"`
 	Accounts          []AccountStatus    `json:"accounts"`
 	ChildProxies      []ChildProxyStatus `json:"child_proxies,omitempty"`

@@ -769,6 +769,15 @@ func TestProxyStatusRefreshesDisabled401Account(t *testing.T) {
 		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
 	}
 
+	if !waitFor(t, 2*time.Second, 20*time.Millisecond, func() bool {
+		snap := store.Snapshot()
+		return snap.Accounts[0].Enabled &&
+			snap.Accounts[0].DisabledReason == "" &&
+			snap.Accounts[0].Quota.Source == "openai_usage_api"
+	}) {
+		t.Fatalf("expected account to be re-enabled after background status refresh")
+	}
+
 	snap := store.Snapshot()
 	if !snap.Accounts[0].Enabled {
 		t.Fatalf("expected account to be re-enabled")
@@ -1092,15 +1101,24 @@ func TestProxyRoutesViaChildProxyByUsage(t *testing.T) {
 	if status.SelectedProxyURL != childB.URL {
 		t.Fatalf("expected selected proxy %q, got %q", childB.URL, status.SelectedProxyURL)
 	}
+	if status.SelectedProxyName != "child-b" {
+		t.Fatalf("expected selected proxy name child-b, got %q", status.SelectedProxyName)
+	}
 	found := false
+	activeCount := 0
 	for _, account := range status.Accounts {
+		if account.Active {
+			activeCount++
+		}
 		if account.ID == "b" && account.ProxyName == "child-b" {
 			found = true
-			break
 		}
 	}
 	if !found {
 		t.Fatalf("expected aggregated account from child-b, got %+v", status.Accounts)
+	}
+	if activeCount != 1 {
+		t.Fatalf("expected exactly one active account on selected route, got %+v", status.Accounts)
 	}
 	if len(status.ChildProxies) != 2 {
 		t.Fatalf("expected 2 child proxies in status, got %d", len(status.ChildProxies))

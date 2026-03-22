@@ -112,10 +112,11 @@ func TestStatusCommandShort(t *testing.T) {
 
 func TestStatusCommandShortUsesActiveChildProxy(t *testing.T) {
 	status := lb.ProxyStatus{
-		ProxyName:       "main",
-		GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
-		Policy:          lb.PolicyConfig{Mode: lb.PolicyUsageBalanced},
-		SelectionReason: "usage-stay",
+		ProxyName:         "main",
+		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+		Policy:            lb.PolicyConfig{Mode: lb.PolicyUsageBalanced},
+		SelectedProxyName: "child-b",
+		SelectionReason:   "usage-stay",
 		ChildProxies: []lb.ChildProxyStatus{
 			{Name: "child-b", URL: "http://child-b.internal", Active: true, Healthy: true, Reachable: true, Score: 0.9},
 		},
@@ -139,11 +140,12 @@ func TestStatusCommandShortUsesActiveChildProxy(t *testing.T) {
 
 func TestStatusCommandPrintsChildProxyTable(t *testing.T) {
 	status := lb.ProxyStatus{
-		ProxyName:        "main",
-		GeneratedAt:      time.Now().UTC().Format(time.RFC3339),
-		Policy:           lb.PolicyConfig{Mode: lb.PolicyUsageBalanced},
-		SelectedProxyURL: "http://child-b.internal",
-		SelectionReason:  "usage-stay",
+		ProxyName:         "main",
+		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+		Policy:            lb.PolicyConfig{Mode: lb.PolicyUsageBalanced},
+		SelectedProxyURL:  "http://child-b.internal",
+		SelectedProxyName: "child-b",
+		SelectionReason:   "usage-stay",
 		Accounts: []lb.AccountStatus{
 			{ProxyName: "child-b", Alias: "bob", ID: "openai:bob", Active: true, Healthy: true, Enabled: true, Score: 0.9},
 		},
@@ -171,7 +173,7 @@ func TestStatusCommandPrintsChildProxyTable(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d output=%s", code, out)
 	}
-	if !strings.Contains(out, "selected=http://child-b.internal") {
+	if !strings.Contains(out, "selected=child-b") {
 		t.Fatalf("expected selected child proxy in output: %s", out)
 	}
 	if !strings.Contains(out, "child-b") {

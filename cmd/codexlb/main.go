@@ -1074,7 +1074,10 @@ func printStatusTable(status lb.ProxyStatus) {
 	pinnedAlias := pinnedAliasForStatus(status)
 	selected := status.SelectedAccountID
 	if selected == "" {
-		selected = status.SelectedProxyURL
+		selected = status.SelectedProxyName
+		if selected == "" {
+			selected = status.SelectedProxyURL
+		}
 	}
 	fmt.Printf("proxy=%s policy=%s selected=%s pinned=%s reason=%s generated_at=%s\n", noneIfEmpty(status.ProxyName), status.Policy.Mode, noneIfEmpty(selected), noneIfEmpty(pinnedAlias), noneIfEmpty(status.SelectionReason), status.GeneratedAt)
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
