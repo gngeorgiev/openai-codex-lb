@@ -1225,6 +1225,10 @@ func printStatusTable(status lb.ProxyStatus) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "ACTIVE\tPIN\tPROXY\tALIAS\tID\tEMAIL\tSTATUS\tDAILY_LEFT\tDAILY_RESET\tWEEKLY_LEFT\tWEEKLY_RESET\tSCORE\tLAST_SWITCH\tQUOTA")
 	pinnedID := strings.TrimSpace(status.State.PinnedAccountID)
+	dailyTotal := 0.0
+	dailyCount := 0
+	weeklyTotal := 0.0
+	weeklyCount := 0
 	for _, a := range status.Accounts {
 		active := ""
 		if a.Active {
@@ -1270,8 +1274,17 @@ func printStatusTable(status lb.ProxyStatus) {
 		}
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.3f\t%s\t%s\n",
 			active, pin, noneIfEmpty(a.ProxyName), a.Alias, a.ID, email, state, daily, dailyReset, weekly, weeklyReset, a.Score, lastSwitch, quota)
+		if a.DailyLeftPct >= 0 {
+			dailyTotal += a.DailyLeftPct
+			dailyCount++
+		}
+		if a.WeeklyLeftPct >= 0 {
+			weeklyTotal += a.WeeklyLeftPct
+			weeklyCount++
+		}
 	}
 	_ = w.Flush()
+	fmt.Printf("aggregate usage left: daily=%s weekly=%s\n", formatAggregatePercent(dailyTotal, dailyCount), formatAggregatePercent(weeklyTotal, weeklyCount))
 
 	if len(status.ChildProxies) == 0 {
 		return
@@ -1333,6 +1346,13 @@ func noneIfEmpty(v string) string {
 		return "none"
 	}
 	return v
+}
+
+func formatAggregatePercent(total float64, count int) string {
+	if count <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%.1f%%", total/float64(count))
 }
 
 func defaultRootFlagValue() string {

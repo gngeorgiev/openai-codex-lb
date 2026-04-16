@@ -63,6 +63,36 @@ func TestStatusCommandPrintsTable(t *testing.T) {
 	if !strings.Contains(out, "2024-03-16T14:40:00Z") {
 		t.Fatalf("expected weekly reset timestamp in output: %s", out)
 	}
+	if !strings.Contains(out, "aggregate usage left: daily=80.0% weekly=70.0%") {
+		t.Fatalf("expected aggregate usage line in output: %s", out)
+	}
+}
+
+func TestStatusCommandAggregateUsageLeftAveragesAccounts(t *testing.T) {
+	status := lb.ProxyStatus{
+		ProxyName:   "main",
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Policy:      lb.PolicyConfig{Mode: lb.PolicyUsageBalanced},
+		Accounts: []lb.AccountStatus{
+			{ProxyName: "main", Alias: "a", ID: "openai:a", Enabled: true, DailyLeftPct: 100, WeeklyLeftPct: 80},
+			{ProxyName: "main", Alias: "b", ID: "openai:b", Enabled: true, DailyLeftPct: 70, WeeklyLeftPct: 50},
+			{ProxyName: "main", Alias: "c", ID: "openai:c", Enabled: true, DailyLeftPct: 40, WeeklyLeftPct: 20},
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(status)
+	}))
+	defer server.Close()
+
+	out, code := captureStdout(func() int {
+		return run([]string{"status", "--root", t.TempDir(), "--proxy-url", server.URL})
+	})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d output=%s", code, out)
+	}
+	if !strings.Contains(out, "aggregate usage left: daily=70.0% weekly=50.0%") {
+		t.Fatalf("unexpected aggregate usage line: %s", out)
+	}
 }
 
 func TestStatusCommandJSON(t *testing.T) {
