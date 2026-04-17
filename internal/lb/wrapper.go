@@ -264,8 +264,8 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 	}
 
 	if remoteAuth, err := fetchRemoteRuntimeAuth(proxyURL); err == nil {
-		if err := os.WriteFile(targetAuth, remoteAuth.Auth, 0o600); err != nil {
-			return fmt.Errorf("seed runtime auth.json from remote proxy: %w", err)
+		if err := writeProxyOnlyRuntimeAuth(targetAuth); err != nil {
+			return fmt.Errorf("write proxy-only runtime auth.json: %w", err)
 		}
 		if err := syncRuntimeConfigFromRemote(remoteAuth, codexHome); err != nil {
 			return err
@@ -425,6 +425,9 @@ func writeProxyOnlyRuntimeAuth(path string) error {
 func proxyOnlyRuntimeAuthPayload() ([]byte, error) {
 	token := buildProxyOnlyAccessToken()
 	payload := map[string]any{
+		"auth_mode":      "chatgpt",
+		"OPENAI_API_KEY": nil,
+		"last_refresh":   time.Now().UTC().Format(time.RFC3339),
 		"tokens": map[string]any{
 			"access_token":  token,
 			"refresh_token": token,
@@ -441,7 +444,18 @@ func proxyOnlyRuntimeAuthPayload() ([]byte, error) {
 
 func buildProxyOnlyAccessToken() string {
 	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	body := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"codexlb-proxy-only","exp":4102444800}`))
+	payload := map[string]any{
+		"sub": "codexlb-proxy-only",
+		"exp": 4102444800,
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "proxy-only",
+		},
+		"https://api.openai.com/profile": map[string]any{
+			"email": "proxy-only@codexlb.internal",
+		},
+	}
+	b, _ := json.Marshal(payload)
+	body := base64.RawURLEncoding.EncodeToString(b)
 	return head + "." + body + ".sig"
 }
 
