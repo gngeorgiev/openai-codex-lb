@@ -1462,6 +1462,112 @@ func TestProxySelectsLocalAccountOverChildProxyWhenScoreIsHigher(t *testing.T) {
 	}
 }
 
+func TestProxyPrefersLocalRouteWhenChildProxyAverageCapacityIsLower(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	localToken := testJWT(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-local"}})
+	homeLocal := filepath.Join(root, "local")
+	writeAuthFile(t, homeLocal, localToken, "acct-local")
+
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			_ = json.NewEncoder(w).Encode(ProxyStatus{
+				ProxyName:       "edge-vpn",
+				GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
+				SelectionReason: "usage-stay",
+				Accounts: []AccountStatus{
+					{ProxyName: "edge-vpn", Alias: "vpn-a", ID: "vpn-a", Active: true, Healthy: true, Enabled: true, Score: 1.0},
+					{ProxyName: "edge-vpn", Alias: "vpn-b", ID: "vpn-b", Active: false, Healthy: true, Enabled: true, Score: 0.0},
+				},
+			})
+		case "/responses":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"source":"child"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer child.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/codex/responses":
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"source":"local"}`)
+		case "/backend-api/wham/usage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"rate_limit":{"primary_window":{"used_percent":20},"secondary_window":{"used_percent":20}}}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.Name = "edge-main"
+		sf.Settings.Policy.Mode = PolicyUsageBalanced
+		sf.Settings.Proxy.ChildProxyURLs = []string{child.URL}
+		sf.Settings.Proxy.UpstreamBaseURL = upstream.URL + "/backend-api"
+		sf.Accounts = []Account{
+			{
+				ID:      "local",
+				Alias:   "local",
+				HomeDir: homeLocal,
+				BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+				Enabled: true,
+				Quota: QuotaState{
+					DailyLimit:  100,
+					DailyUsed:   20,
+					WeeklyLimit: 100,
+					WeeklyUsed:  20,
+					Source:      "manual",
+				},
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	mainProxy := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer mainProxy.Close()
+
+	resp, err := http.Post(mainProxy.URL+"/responses", "application/json", bytes.NewBufferString(`{"input":"hi"}`))
+	if err != nil {
+		t.Fatalf("post to main proxy: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), `"source":"local"`) {
+		t.Fatalf("expected local account to win selection, got body=%s", string(body))
+	}
+
+	statusResp, err := http.Get(mainProxy.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer statusResp.Body.Close()
+	var status ProxyStatus
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status.SelectedAccountID != "local" {
+		t.Fatalf("expected local account selected, got %+v", status)
+	}
+	if status.SelectedProxyURL != "" || status.SelectedProxyName != "" {
+		t.Fatalf("expected no selected child proxy when child average is lower, got %+v", status)
+	}
+}
+
 func TestProxyChainsChildProxiesRecursively(t *testing.T) {
 	t.Parallel()
 

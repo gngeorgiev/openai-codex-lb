@@ -362,24 +362,25 @@ func (p *ProxyServer) markLocalRouteActive(accountID string) {
 }
 
 func summarizeProxyCapacity(status ProxyStatus) (proxyCapacitySummary, bool) {
-	best := -1.0
+	total := 0.0
+	count := 0
 	for _, account := range status.Accounts {
 		if !account.Healthy || !account.Enabled || account.DisabledReason != "" {
 			continue
 		}
-		if account.Score > best {
-			best = account.Score
+		total += clamp01(account.Score)
+		count++
+	}
+	if count == 0 {
+		for _, child := range status.ChildProxies {
+			if !child.Healthy {
+				continue
+			}
+			total += clamp01(child.Score)
+			count++
 		}
 	}
-	for _, child := range status.ChildProxies {
-		if !child.Healthy {
-			continue
-		}
-		if child.Score > best {
-			best = child.Score
-		}
-	}
-	if best < 0 {
+	if count == 0 {
 		return proxyCapacitySummary{}, false
 	}
 
@@ -388,7 +389,7 @@ func summarizeProxyCapacity(status ProxyStatus) (proxyCapacitySummary, bool) {
 		selectedTarget = strings.TrimSpace(status.SelectedProxyURL)
 	}
 	return proxyCapacitySummary{
-		Score:          best,
+		Score:          total / float64(count),
 		SelectedTarget: selectedTarget,
 	}, true
 }
