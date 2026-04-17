@@ -1483,6 +1483,126 @@ func TestProxyFailsOverAcrossChildProxies(t *testing.T) {
 	}
 }
 
+func TestProxyRetriesUsageLimitOnLocalRouteViaChildProxy(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	tokenLocal := testJWT(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-local"}})
+	homeLocal := filepath.Join(root, "local")
+	writeAuthFile(t, homeLocal, tokenLocal, "acct-local")
+
+	var localHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/wham/usage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"rate_limit":{"primary_window":{"used_percent":5},"secondary_window":{"used_percent":5}}}`)
+		case "/backend-api/codex/responses":
+			localHits++
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"error":"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later."}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	var childHits int
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			_ = json.NewEncoder(w).Encode(ProxyStatus{
+				ProxyName:       "child-b",
+				GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
+				SelectionReason: "usage-stay",
+				Accounts: []AccountStatus{
+					{ProxyName: "child-b", Alias: "remote", ID: "remote", Active: true, Healthy: true, Enabled: true, Score: 0.20},
+				},
+			})
+		case "/responses":
+			childHits++
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"source":"child"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer child.Close()
+
+	nowMS := time.Now().UnixMilli()
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.Name = "edge-main"
+		sf.Settings.Proxy.UpstreamBaseURL = upstream.URL + "/backend-api"
+		sf.Settings.Proxy.MaxAttempts = 3
+		sf.Settings.Proxy.ChildProxyURLs = []string{child.URL}
+		sf.Settings.Policy.Mode = PolicySticky
+		sf.Settings.Quota.RefreshIntervalMinutes = 999
+		sf.Settings.Quota.RefreshIntervalMessages = 999
+		sf.Accounts = []Account{
+			{
+				ID:      "local",
+				Alias:   "local",
+				HomeDir: homeLocal,
+				BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+				Enabled: true,
+				Quota: QuotaState{
+					DailyLimit:             100,
+					DailyUsed:              5,
+					WeeklyLimit:            100,
+					WeeklyUsed:             5,
+					LastSyncAt:             nowMS,
+					LastSyncMessageCounter: 0,
+					Source:                 "manual",
+				},
+			},
+		}
+		sf.State.ActiveIndex = 0
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	mainProxy := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer mainProxy.Close()
+
+	resp, err := http.Post(mainProxy.URL+"/responses", "application/json", bytes.NewBufferString(`{"input":"hi"}`))
+	if err != nil {
+		t.Fatalf("post to main proxy: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), `"source":"child"`) {
+		t.Fatalf("expected failover to child proxy, got body=%s", string(body))
+	}
+	if localHits != 1 {
+		t.Fatalf("expected one local upstream hit, got %d", localHits)
+	}
+	if childHits != 1 {
+		t.Fatalf("expected one child proxy hit, got %d", childHits)
+	}
+
+	snap := store.Snapshot()
+	if !snap.Accounts[0].Enabled {
+		t.Fatalf("expected local account to remain enabled")
+	}
+	if snap.Accounts[0].DisabledReason != "" {
+		t.Fatalf("expected empty disabled reason, got %q", snap.Accounts[0].DisabledReason)
+	}
+	if snap.Accounts[0].CooldownUntilMS <= time.Now().UnixMilli() {
+		t.Fatalf("expected local account cooldown to be set")
+	}
+	if snap.Accounts[0].LastSwitchReason != "usage-limit" {
+		t.Fatalf("expected usage-limit switch reason, got %q", snap.Accounts[0].LastSwitchReason)
+	}
+}
+
 func TestProxySelectsLocalAccountOverChildProxyWhenScoreIsHigher(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

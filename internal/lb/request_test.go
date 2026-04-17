@@ -90,6 +90,46 @@ func TestShouldDisableForAuthFailure(t *testing.T) {
 	}
 }
 
+func TestIsUsageLimitResponse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		body string
+		path string
+		want bool
+	}{
+		{
+			name: "matches codex usage limit message",
+			path: "/responses",
+			body: "You've hit your usage limit. Upgrade to Pro, visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again later.",
+			want: true,
+		},
+		{
+			name: "ignores unrelated forbidden body",
+			path: "/responses",
+			body: `{"error":"forbidden"}`,
+			want: false,
+		},
+		{
+			name: "ignores non account scoped path",
+			path: "/models",
+			body: "You've hit your usage limit.",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isUsageLimitResponse(http.StatusForbidden, tt.path, tt.body); got != tt.want {
+				t.Fatalf("isUsageLimitResponse(403, %q, %q) = %t, want %t", tt.path, tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBackfillModelsDisplayNamesJSON(t *testing.T) {
 	t.Parallel()
 

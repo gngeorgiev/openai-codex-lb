@@ -84,6 +84,19 @@ func isAccountScopedPath(requestPath string) bool {
 		strings.Contains(requestPath, "/backend-api/codex/responses")
 }
 
+func isUsageLimitResponse(status int, requestPath, body string) bool {
+	if status != http.StatusForbidden || !isAccountScopedPath(requestPath) {
+		return false
+	}
+	body = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(body), "’", "'"))
+	if body == "" {
+		return false
+	}
+	return strings.Contains(body, "you've hit your usage limit") ||
+		(strings.Contains(body, "usage limit") && strings.Contains(body, "purchase more credits")) ||
+		strings.Contains(body, "chatgpt.com/codex/settings/usage")
+}
+
 func accountResponsesSuffix(requestPath string) (string, bool) {
 	requestPath = strings.ToLower(requestPath)
 	switch {

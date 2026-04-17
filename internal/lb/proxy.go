@@ -734,6 +734,7 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request, now tim
 	var lastResp *http.Response
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		snapshot = p.store.Snapshot()
 		if hasChildProxyRouting(snapshot) {
 			route, err := p.selectRoute(r.Context(), snapshot, now, attempt == 1)
 			if err != nil {
@@ -848,9 +849,42 @@ func (p *ProxyServer) handleHTTPViaPickedAccount(w http.ResponseWriter, r *http.
 		return false
 	}
 
+	var respBody []byte
+	bodySnippet := ""
+	loadBodySnippet := func() string {
+		if bodySnippet != "" || resp == nil || resp.Body == nil {
+			return bodySnippet
+		}
+		respBody, err = bufferResponseBody(resp)
+		if err != nil {
+			return ""
+		}
+		bodySnippet = responseBodySnippet(respBody, maxDisableBodyLogBytes)
+		return bodySnippet
+	}
+
+	if resp.StatusCode == http.StatusForbidden && isUsageLimitResponse(resp.StatusCode, r.URL.Path, loadBodySnippet()) {
+		retryAfter := parseRetryAfterSeconds(resp.Header)
+		cooldown := max(snapshot.Settings.Proxy.CooldownDefaultS, retryAfter)
+		p.markCooldown(account.ID, resp.StatusCode, cooldown, "usage-limit")
+		p.logEvent("account.cooldown", map[string]any{
+			"req_id":           reqID,
+			"attempt":          attempt,
+			"account_id":       account.ID,
+			"status":           resp.StatusCode,
+			"cooldown_seconds": cooldown,
+			"retry_after":      retryAfter,
+			"reason":           "usage-limit",
+			"error_body":       bodySnippet,
+		})
+		if attempt < maxAttempts {
+			*lastResp = resp
+			return false
+		}
+	}
+
 	if shouldDisableForAuthFailure(resp.StatusCode, r.URL.Path) {
-		bodySnippet := readBodySnippet(resp.Body, maxDisableBodyLogBytes)
-		_ = resp.Body.Close()
+		bodySnippet = loadBodySnippet()
 		refreshedAuth, refreshed, refreshErr := p.tryRefreshAccountAuth(r.Context(), account, auth)
 		if refreshErr == nil && refreshed {
 			upstreamReq, err = http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), bytes.NewReader(body))
@@ -1469,6 +1503,35 @@ func readBodySnippet(r io.Reader, maxBytes int) string {
 	body, err := io.ReadAll(io.LimitReader(r, int64(maxBytes)))
 	if err != nil {
 		return ""
+	}
+	return strings.TrimSpace(string(body))
+}
+
+func bufferResponseBody(resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	if len(body) == 0 {
+		resp.Header.Del("Content-Length")
+	} else {
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	}
+	return body, nil
+}
+
+func responseBodySnippet(body []byte, maxBytes int) string {
+	if len(body) == 0 || maxBytes <= 0 {
+		return ""
+	}
+	if len(body) > maxBytes {
+		body = body[:maxBytes]
 	}
 	return strings.TrimSpace(string(body))
 }
