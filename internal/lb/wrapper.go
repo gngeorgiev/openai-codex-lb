@@ -446,7 +446,7 @@ func buildProxyOnlyAccessToken() string {
 	head := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	payload := map[string]any{
 		"sub": "codexlb-proxy-only",
-		"exp": 4102444800,
+		"exp": int64(4102444800),
 		"https://api.openai.com/auth": map[string]any{
 			"chatgpt_account_id": "proxy-only",
 		},
