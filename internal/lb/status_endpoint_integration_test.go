@@ -3,9 +3,11 @@ package lb
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -442,5 +444,88 @@ func TestProxyStatusEndpointUsesCachedChildProxyStatusWhenRefreshIsSlow(t *testi
 	case <-refreshStarted:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected /status to refresh child proxy status in the background")
+	}
+}
+
+func TestProxyStatusEndpointUsesCachedChildProxyStatusOnTransientRefreshFailure(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	var failRefresh atomic.Bool
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/status" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if failRefresh.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `temporary failure`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ProxyStatus{
+			ProxyName:       "child-a",
+			GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
+			SelectionReason: "usage-stay",
+			Accounts: []AccountStatus{
+				{ProxyName: "child-a", Alias: "a", ID: "a", Active: true, Healthy: true, Enabled: true, Score: 0.9},
+			},
+		})
+	}))
+	defer child.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.Name = "main"
+		sf.Settings.Policy.Mode = PolicyUsageBalanced
+		sf.Settings.Proxy.ChildProxyURLs = []string{child.URL}
+		sf.Accounts = nil
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxy := NewProxyServer(store, nil, nil)
+	now := time.Now()
+	snapshot := store.Snapshot()
+	sel, target, err := proxy.selectChildProxy(context.Background(), snapshot, now, true)
+	if err != nil {
+		t.Fatalf("warm child proxy status: %v", err)
+	}
+	proxy.markChildProxySuccess(sel, target.URL, now)
+	failRefresh.Store(true)
+
+	srv := httptest.NewServer(proxy)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	var status ProxyStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status.SelectedProxyURL != child.URL {
+		t.Fatalf("expected selected proxy %q, got %q", child.URL, status.SelectedProxyURL)
+	}
+	if status.SelectedProxyName != "child-a" {
+		t.Fatalf("expected selected proxy name child-a, got %q", status.SelectedProxyName)
+	}
+	if len(status.Accounts) != 1 || status.Accounts[0].ID != "a" || !status.Accounts[0].Active {
+		t.Fatalf("expected cached child account to stay visible, got %+v", status.Accounts)
+	}
+	if len(status.ChildProxies) != 1 {
+		t.Fatalf("expected one child proxy, got %+v", status.ChildProxies)
+	}
+	if !status.ChildProxies[0].Reachable || !status.ChildProxies[0].Healthy {
+		t.Fatalf("expected child proxy to stay reachable and healthy, got %+v", status.ChildProxies[0])
 	}
 }

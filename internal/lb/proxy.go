@@ -182,12 +182,40 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.expireCooldowns(now)
 	p.expireChildProxyCooldowns(now)
 	p.maybeRefreshQuota(r.Context(), now, false)
+	if p.handleAggregatedUsageForProxyOnly(w, r, now, reqID) {
+		return
+	}
 
 	if isWebSocketUpgrade(r) {
 		p.handleWebsocket(w, r, now, reqID)
 		return
 	}
 	p.handleHTTP(w, r, now, reqID)
+}
+
+func (p *ProxyServer) handleAggregatedUsageForProxyOnly(w http.ResponseWriter, r *http.Request, now time.Time, reqID uint64) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	if r.URL.Path != "/backend-api/wham/usage" && r.URL.Path != "/api/codex/usage" {
+		return false
+	}
+	if !isProxyOnlyRuntimeAuthRequest(r.Header.Get("Authorization")) {
+		return false
+	}
+
+	status := p.buildStatus(context.WithoutCancel(r.Context()), p.store.Snapshot(), now, false)
+	payload := aggregateUsageResponse(status, now)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(payload)
+	p.logEvent("request.completed", map[string]any{
+		"req_id": reqID,
+		"status": http.StatusOK,
+		"path":   r.URL.Path,
+		"mode":   "aggregated-proxy-only-usage",
+	})
+	return true
 }
 
 func (p *ProxyServer) handleAdmin(w http.ResponseWriter, r *http.Request) int {

@@ -251,6 +251,22 @@ func nestedString(m map[string]any, keys ...string) string {
 	return v
 }
 
+func isProxyOnlyRuntimeAuthRequest(authHeader string) bool {
+	authHeader = strings.TrimSpace(authHeader)
+	if authHeader == "" {
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(authHeader, prefix) {
+		return false
+	}
+	claims, err := decodeJWTPayload(strings.TrimSpace(authHeader[len(prefix):]))
+	if err != nil {
+		return false
+	}
+	return nestedString(claims, "https://api.openai.com/auth", "chatgpt_account_id") == "proxy-only"
+}
+
 func parseRefreshError(raw string) (code, message string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

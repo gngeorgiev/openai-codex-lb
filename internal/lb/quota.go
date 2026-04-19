@@ -140,6 +140,90 @@ func parseRetryAfterSeconds(headers http.Header) int {
 	return 0
 }
 
+func aggregateUsageResponse(status ProxyStatus, now time.Time) usageResponse {
+	dailyUsedPercent, dailyResetAt := aggregateUsageWindow(status.Accounts, now, func(a AccountStatus) (float64, int64) {
+		if a.DailyLeftPct < 0 {
+			return -1, 0
+		}
+		return clampUsagePercent(100 - a.DailyLeftPct), a.DailyResetAt
+	})
+	weeklyUsedPercent, weeklyResetAt := aggregateUsageWindow(status.Accounts, now, func(a AccountStatus) (float64, int64) {
+		if a.WeeklyLeftPct < 0 {
+			return -1, 0
+		}
+		return clampUsagePercent(100 - a.WeeklyLeftPct), a.WeeklyResetAt
+	})
+
+	var payload usageResponse
+	payload.RateLimit.PrimaryWindow.Limit = 100
+	payload.RateLimit.PrimaryWindow.Used = dailyUsedPercent
+	payload.RateLimit.PrimaryWindow.UsedPercent = dailyUsedPercent
+	payload.RateLimit.PrimaryWindow.ResetAt = dailyResetAt
+	payload.RateLimit.PrimaryWindow.ResetsAt = dailyResetAt
+	if dailyResetAt > 0 {
+		payload.RateLimit.PrimaryWindow.ResetAfterSeconds = maxInt64(0, dailyResetAt-now.Unix())
+	}
+
+	payload.RateLimit.SecondaryWindow.Limit = 100
+	payload.RateLimit.SecondaryWindow.Used = weeklyUsedPercent
+	payload.RateLimit.SecondaryWindow.UsedPercent = weeklyUsedPercent
+	payload.RateLimit.SecondaryWindow.ResetAt = weeklyResetAt
+	payload.RateLimit.SecondaryWindow.ResetsAt = weeklyResetAt
+	if weeklyResetAt > 0 {
+		payload.RateLimit.SecondaryWindow.ResetAfterSeconds = maxInt64(0, weeklyResetAt-now.Unix())
+	}
+
+	return payload
+}
+
+func aggregateUsageWindow(accounts []AccountStatus, now time.Time, extract func(AccountStatus) (usedPercent float64, resetAt int64)) (float64, int64) {
+	total := 0.0
+	count := 0
+	earliestReset := int64(0)
+	for _, account := range accounts {
+		if !account.Enabled || account.DisabledReason != "" || !account.Healthy {
+			continue
+		}
+		usedPercent, resetAt := extract(account)
+		if usedPercent < 0 {
+			continue
+		}
+		total += usedPercent
+		count++
+		if resetAt > now.Unix() && (earliestReset == 0 || resetAt < earliestReset) {
+			earliestReset = resetAt
+		}
+	}
+	if count == 0 {
+		for _, account := range accounts {
+			usedPercent, resetAt := extract(account)
+			if usedPercent < 0 {
+				continue
+			}
+			total += usedPercent
+			count++
+			if resetAt > now.Unix() && (earliestReset == 0 || resetAt < earliestReset) {
+				earliestReset = resetAt
+			}
+		}
+	}
+	if count == 0 {
+		return 0, 0
+	}
+	return total / float64(count), earliestReset
+}
+
+func clampUsagePercent(v float64) float64 {
+	return math.Max(0, math.Min(100, v))
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func authFailureStatusFromError(err error) int {
 	var statusErr *upstreamStatusError
 	if !errors.As(err, &statusErr) {

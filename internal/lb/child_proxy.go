@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const childProxyStatusCacheTTL = time.Second
+const (
+	childProxyStatusCacheTTL     = time.Second
+	childProxyStatusFailureGrace = 15 * time.Second
+)
 
 type childProxyRuntime struct {
 	CooldownUntilMS  int64
@@ -294,22 +297,41 @@ func (p *ProxyServer) fetchChildProxyStatus(ctx context.Context, proxyURL string
 	}
 	resp, err := p.usageClient.Do(req)
 	if err != nil {
+		if fallback, ok := childProxyStatusFallback(state, now); ok {
+			return fallback, nil
+		}
 		p.recordChildProxyStatus(proxyURL, ProxyStatus{}, time.Now(), false, err.Error())
 		return ProxyStatus{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if fallback, ok := childProxyStatusFallback(state, now); ok {
+			return fallback, nil
+		}
 		p.recordChildProxyStatus(proxyURL, ProxyStatus{}, time.Now(), false, fmt.Sprintf("status %d", resp.StatusCode))
 		return ProxyStatus{}, fmt.Errorf("query child proxy status %s: status %d", proxyURL, resp.StatusCode)
 	}
 
 	var status ProxyStatus
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		if fallback, ok := childProxyStatusFallback(state, now); ok {
+			return fallback, nil
+		}
 		p.recordChildProxyStatus(proxyURL, ProxyStatus{}, time.Now(), false, err.Error())
 		return ProxyStatus{}, err
 	}
 	p.recordChildProxyStatus(proxyURL, status, time.Now(), true, "")
 	return status, nil
+}
+
+func childProxyStatusFallback(state childProxyRuntime, now time.Time) (ProxyStatus, bool) {
+	if !state.Reachable || state.StatusFetchedAt.IsZero() {
+		return ProxyStatus{}, false
+	}
+	if now.Sub(state.StatusFetchedAt) > childProxyStatusFailureGrace {
+		return ProxyStatus{}, false
+	}
+	return state.Status, true
 }
 
 func (p *ProxyServer) recordChildProxyStatus(proxyURL string, status ProxyStatus, fetchedAt time.Time, reachable bool, lastError string) {
