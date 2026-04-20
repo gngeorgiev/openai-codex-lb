@@ -535,6 +535,86 @@ func TestAccountLoginAllowsEmailAlias(t *testing.T) {
 	}
 }
 
+func TestAccountLoginFallsBackToLocalLoginImportWhenRemoteCodexMissing(t *testing.T) {
+	root := t.TempDir()
+	fakeLog := filepath.Join(root, "fake-codex.log")
+	fakeBin := filepath.Join(root, "codex")
+	writeFakeCodex(t, fakeBin)
+
+	t.Setenv("CODEXLB_CODEX_BIN", fakeBin)
+	t.Setenv("FAKE_LOG", fakeLog)
+	t.Setenv("FAKE_TOKEN", testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-a"},
+		"https://api.openai.com/profile": map[string]any{"email": "alice@example.com"},
+	}))
+	t.Setenv("FAKE_ACCOUNT_ID", "acct-a")
+
+	loginCalls := 0
+	importCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/admin/account/login":
+			loginCalls++
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Add("Trailer", adminLoginStreamExitCodeTrailer)
+			w.Header().Add("Trailer", adminLoginStreamErrorTrailer)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "remote login unavailable\n")
+			w.Header().Set(adminLoginStreamExitCodeTrailer, "1")
+			w.Header().Set(adminLoginStreamErrorTrailer, `run codex login --device-auth: exec: "codex": executable file not found in $PATH`)
+		case "/admin/account/import":
+			importCalls++
+			var req lb.AdminImportRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode import request: %v", err)
+			}
+			if req.Alias != "alice" {
+				t.Fatalf("unexpected alias: %q", req.Alias)
+			}
+			if len(req.Auth) == 0 {
+				t.Fatalf("expected auth payload")
+			}
+			authText := string(req.Auth)
+			if !strings.Contains(authText, `"account_id":"acct-a"`) {
+				t.Fatalf("unexpected auth payload: %s", authText)
+			}
+			if req.Config != "" {
+				t.Fatalf("expected empty config, got %q", req.Config)
+			}
+			_ = json.NewEncoder(w).Encode(lb.AdminMutationResponse{OK: true, Message: "imported account alice (total=1)"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	out, code := captureStdout(func() int {
+		return run([]string{"account", "login", "--root", root, "--proxy-url", server.URL, "alice"})
+	})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d out=%s", code, out)
+	}
+	if loginCalls != 1 {
+		t.Fatalf("expected one remote login call, got %d", loginCalls)
+	}
+	if importCalls != 1 {
+		t.Fatalf("expected one remote import call, got %d", importCalls)
+	}
+	if !strings.Contains(out, "remote codex unavailable; logging in locally and importing auth") {
+		t.Fatalf("missing fallback notice: %q", out)
+	}
+	if !strings.Contains(out, "imported account alice") {
+		t.Fatalf("missing import success output: %q", out)
+	}
+	data, err := os.ReadFile(fakeLog)
+	if err != nil {
+		t.Fatalf("read fake log: %v", err)
+	}
+	if !strings.Contains(string(data), "LOGIN_ARGS=login --device-auth") {
+		t.Fatalf("unexpected fake log: %s", string(data))
+	}
+}
+
 func TestAccountImportDefaultsToConfiguredProxyURL(t *testing.T) {
 	source := t.TempDir()
 	auth := `{"tokens":{"access_token":"` + testJWT(map[string]any{

@@ -370,7 +370,7 @@ Flags:
 	}
 	targetProxyURL := resolveAccountAdminTargetURL(store, *proxyURL, strings.TrimSpace(*proxyName))
 	if targetProxyURL != "" {
-		err := remoteAdminLoginStreamWithClient(http.DefaultClient, targetProxyURL, strings.TrimSpace(*proxyName), alias, *codexBin, loginArgs, os.Stdout)
+		err := remoteLoginWithLocalImportFallback(http.DefaultClient, store, targetProxyURL, strings.TrimSpace(*proxyName), alias, *codexBin, loginArgs, os.Stdout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "login account (remote): %v\n", err)
 			return 1
@@ -901,7 +901,56 @@ func tryRemoteUnpinWithFallback(store *lb.Store) error {
 }
 
 func tryRemoteLoginWithFallback(store *lb.Store, alias, codexBin string, loginArgs []string) error {
-	return remoteAdminLoginStreamWithClient(remoteAdminFallbackClient(), resolveProxyURL(store, ""), "", alias, codexBin, loginArgs, os.Stdout)
+	return remoteLoginWithLocalImportFallback(remoteAdminFallbackClient(), store, resolveProxyURL(store, ""), "", alias, codexBin, loginArgs, os.Stdout)
+}
+
+func remoteLoginWithLocalImportFallback(client *http.Client, store *lb.Store, proxyURL, targetProxyName, alias, codexBin string, loginArgs []string, out io.Writer) error {
+	err := remoteAdminLoginStreamWithClient(client, proxyURL, targetProxyName, alias, codexBin, loginArgs, out)
+	if err == nil || !isRemoteCodexMissing(err) {
+		return err
+	}
+
+	tempHome, err := os.MkdirTemp("", "codexlb-remote-login-*")
+	if err != nil {
+		return fmt.Errorf("create temporary CODEX_HOME for remote login fallback: %w", err)
+	}
+	defer os.RemoveAll(tempHome)
+
+	if out != nil {
+		_, _ = fmt.Fprintln(out, "remote codex unavailable; logging in locally and importing auth")
+	}
+	if err := lb.LoginAccountToHome(store, alias, tempHome, codexBin, effectiveLocalLoginArgs(store, loginArgs)); err != nil {
+		return err
+	}
+	resp, err := remoteAdminImportHomeWithClient(client, proxyURL, targetProxyName, alias, tempHome)
+	if err != nil {
+		return err
+	}
+	if out != nil && strings.TrimSpace(resp.Message) != "" {
+		_, _ = fmt.Fprintln(out, strings.TrimSpace(resp.Message))
+	}
+	return nil
+}
+
+func effectiveLocalLoginArgs(store *lb.Store, args []string) []string {
+	args = append([]string(nil), args...)
+	if len(args) > 0 || store == nil {
+		return args
+	}
+	for _, part := range store.Snapshot().Settings.Commands.Login {
+		if strings.TrimSpace(part) == "--device-auth" {
+			return args
+		}
+	}
+	return []string{"--device-auth"}
+}
+
+func isRemoteCodexMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, `exec: "codex": executable file not found in $PATH`)
 }
 
 func tryRemoteImportWithFallback(store *lb.Store, alias, from string) (lb.AdminMutationResponse, error) {

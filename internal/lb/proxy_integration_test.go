@@ -234,6 +234,79 @@ func TestProxyReturnsAggregatedUsageForProxyOnlyRuntimeAuth(t *testing.T) {
 	}
 }
 
+func TestProxyReturnsAggregatedUsageForProxyOnlyRuntimeAuthAtRootUsagePath(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	token := testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-a"},
+		"https://api.openai.com/profile": map[string]any{"email": "a@example.com"},
+	})
+
+	home := filepath.Join(tmp, "acc-a")
+	writeAuthFile(t, home, token, "acct-a")
+
+	now := time.Now()
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.UpstreamBaseURL = "https://chatgpt.com/backend-api"
+		sf.Accounts = []Account{
+			{
+				ID:      "a",
+				Alias:   "a",
+				HomeDir: home,
+				BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+				Enabled: true,
+				Quota: QuotaState{
+					DailyLimit:    100,
+					DailyUsed:     25,
+					DailyResetAt:  now.Add(2 * time.Hour).Unix(),
+					WeeklyLimit:   100,
+					WeeklyUsed:    50,
+					WeeklyResetAt: now.Add(5 * 24 * time.Hour).Unix(),
+					LastSyncAt:    now.UnixMilli(),
+					Source:        "manual",
+				},
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxySrv := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer proxySrv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, proxySrv.URL+"/usage", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+buildProxyOnlyAccessToken(proxyOnlyRuntimeProfile{}))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET usage: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+
+	var payload usageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode usage payload: %v", err)
+	}
+	if payload.PlanType != "plus" {
+		t.Fatalf("expected plan_type plus, got %q", payload.PlanType)
+	}
+	if got := payload.RateLimit.PrimaryWindow.UsedPercent; got != 25 {
+		t.Fatalf("expected aggregated primary used_percent 25, got %v", got)
+	}
+}
+
 func TestProxyForwardsCompactResponsesPath(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

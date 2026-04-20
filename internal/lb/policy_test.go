@@ -64,3 +64,78 @@ func TestSelectAccountStickyFallsBackWhenActiveCoolingDown(t *testing.T) {
 		t.Fatalf("unexpected reason: %s", sel.SwitchReason)
 	}
 }
+
+func TestSelectAccountUsageBalancedSkipsExhaustedAccounts(t *testing.T) {
+	t.Parallel()
+	sf := defaultStore()
+	sf.Settings.Policy.Mode = PolicyUsageBalanced
+	sf.Settings.Policy.DeltaPercent = 10
+	sf.Accounts = []Account{
+		{
+			ID:      "a",
+			Enabled: true,
+			Quota: QuotaState{
+				DailyLimit:  100,
+				DailyUsed:   100,
+				WeeklyLimit: 100,
+				WeeklyUsed:  10,
+			},
+		},
+		{
+			ID:      "b",
+			Enabled: true,
+			Quota: QuotaState{
+				DailyLimit:  100,
+				DailyUsed:   40,
+				WeeklyLimit: 100,
+				WeeklyUsed:  10,
+			},
+		},
+	}
+	sf.State.ActiveIndex = 0
+
+	sel, err := selectAccount(&sf, 0)
+	if err != nil {
+		t.Fatalf("selectAccount: %v", err)
+	}
+	if sel.Index != 1 {
+		t.Fatalf("expected non-exhausted account index 1, got %d", sel.Index)
+	}
+}
+
+func TestSelectAccountUsageBalancedFallsBackWhenAllHealthyAccountsAreExhausted(t *testing.T) {
+	t.Parallel()
+	sf := defaultStore()
+	sf.Settings.Policy.Mode = PolicyUsageBalanced
+	sf.Accounts = []Account{
+		{
+			ID:      "a",
+			Enabled: true,
+			Quota: QuotaState{
+				DailyLimit:  100,
+				DailyUsed:   100,
+				WeeklyLimit: 100,
+				WeeklyUsed:  100,
+			},
+		},
+		{
+			ID:      "b",
+			Enabled: true,
+			Quota: QuotaState{
+				DailyLimit:  100,
+				DailyUsed:   100,
+				WeeklyLimit: 100,
+				WeeklyUsed:  100,
+			},
+		},
+	}
+	sf.State.ActiveIndex = 0
+
+	sel, err := selectAccount(&sf, 0)
+	if err != nil {
+		t.Fatalf("selectAccount: %v", err)
+	}
+	if sel.Index < 0 || sel.Index > 1 {
+		t.Fatalf("expected exhausted fallback account, got %d", sel.Index)
+	}
+}

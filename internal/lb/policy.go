@@ -18,6 +18,10 @@ func selectAccount(sf *StoreFile, nowMS int64) (Selection, error) {
 	if len(healthy) == 0 {
 		return Selection{Index: -1, SwitchReason: "none-healthy"}, fmt.Errorf("no healthy accounts")
 	}
+	eligible := eligibleIndexes(sf.Accounts, healthy)
+	if len(eligible) > 0 {
+		healthy = eligible
+	}
 
 	if sf.State.PinnedAccountID != "" {
 		for _, idx := range healthy {
@@ -93,6 +97,30 @@ func healthyIndexes(accounts []Account, nowMS int64) []int {
 		out = append(out, i)
 	}
 	return out
+}
+
+func eligibleIndexes(accounts []Account, candidates []int) []int {
+	out := make([]int, 0, len(candidates))
+	for _, idx := range candidates {
+		if idx < 0 || idx >= len(accounts) {
+			continue
+		}
+		if accountQuotaExhausted(accounts[idx]) {
+			continue
+		}
+		out = append(out, idx)
+	}
+	return out
+}
+
+func accountQuotaExhausted(account Account) bool {
+	if account.Quota.DailyLimit > 0 && account.Quota.DailyUsed >= account.Quota.DailyLimit {
+		return true
+	}
+	if account.Quota.WeeklyLimit > 0 && account.Quota.WeeklyUsed >= account.Quota.WeeklyLimit {
+		return true
+	}
+	return false
 }
 
 func score(account Account, policy PolicyConfig) float64 {

@@ -197,7 +197,7 @@ func (p *ProxyServer) handleAggregatedUsageForProxyOnly(w http.ResponseWriter, r
 	if r.Method != http.MethodGet {
 		return false
 	}
-	if r.URL.Path != "/backend-api/wham/usage" && r.URL.Path != "/api/codex/usage" {
+	if r.URL.Path != "/backend-api/wham/usage" && r.URL.Path != "/api/codex/usage" && r.URL.Path != "/usage" {
 		return false
 	}
 	if !isProxyOnlyRuntimeAuthRequest(r.Header.Get("Authorization")) {
