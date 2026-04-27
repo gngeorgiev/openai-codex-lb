@@ -37,3 +37,26 @@ func TestUsageURLBackendAPI(t *testing.T) {
 		t.Fatalf("expected %s, got %s", want, u)
 	}
 }
+
+func TestAggregateUsageResponseMatchesStatusFooterAccountAverage(t *testing.T) {
+	t.Parallel()
+	now := time.Unix(1_700_000_000, 0)
+	status := ProxyStatus{
+		Accounts: []AccountStatus{
+			{Alias: "ready", Enabled: true, Healthy: true, DailyLeftPct: 80, WeeklyLeftPct: 70, DailyResetAt: now.Add(3 * time.Hour).Unix(), WeeklyResetAt: now.Add(5 * 24 * time.Hour).Unix()},
+			{Alias: "disabled", Enabled: false, Healthy: false, DisabledReason: "auth", DailyLeftPct: 20, WeeklyLeftPct: 10, DailyResetAt: now.Add(2 * time.Hour).Unix(), WeeklyResetAt: now.Add(4 * 24 * time.Hour).Unix()},
+		},
+	}
+
+	payload := aggregateUsageResponse(status, now)
+
+	if got := payload.RateLimit.PrimaryWindow.UsedPercent; got != 50 {
+		t.Fatalf("expected primary used_percent 50, got %v", got)
+	}
+	if got := payload.RateLimit.SecondaryWindow.UsedPercent; got != 60 {
+		t.Fatalf("expected secondary used_percent 60, got %v", got)
+	}
+	if got := payload.RateLimit.PrimaryWindow.ResetAt; got != now.Add(2*time.Hour).Unix() {
+		t.Fatalf("expected earliest primary reset from all status accounts, got %d", got)
+	}
+}

@@ -14,13 +14,13 @@ import (
 )
 
 type usageWindow struct {
-	Limit             float64 `json:"limit"`
-	Used              float64 `json:"used"`
-	UsedPercent       float64 `json:"used_percent"`
-	LimitWindowSeconds int64  `json:"limit_window_seconds,omitempty"`
-	ResetAfterSeconds int64   `json:"reset_after_seconds"`
-	ResetAt           int64   `json:"reset_at"`
-	ResetsAt          int64   `json:"resets_at"`
+	Limit              float64 `json:"limit"`
+	Used               float64 `json:"used"`
+	UsedPercent        float64 `json:"used_percent"`
+	LimitWindowSeconds int64   `json:"limit_window_seconds,omitempty"`
+	ResetAfterSeconds  int64   `json:"reset_after_seconds"`
+	ResetAt            int64   `json:"reset_at"`
+	ResetsAt           int64   `json:"resets_at"`
 }
 
 type usageRateLimit struct {
@@ -31,12 +31,12 @@ type usageRateLimit struct {
 }
 
 type usageCredits struct {
-	HasCredits           bool    `json:"has_credits"`
-	Unlimited            bool    `json:"unlimited"`
-	OverageLimitReached  bool    `json:"overage_limit_reached"`
-	Balance              string  `json:"balance"`
-	ApproxLocalMessages  [2]int  `json:"approx_local_messages"`
-	ApproxCloudMessages  [2]int  `json:"approx_cloud_messages"`
+	HasCredits          bool   `json:"has_credits"`
+	Unlimited           bool   `json:"unlimited"`
+	OverageLimitReached bool   `json:"overage_limit_reached"`
+	Balance             string `json:"balance"`
+	ApproxLocalMessages [2]int `json:"approx_local_messages"`
+	ApproxCloudMessages [2]int `json:"approx_cloud_messages"`
 }
 
 type usageSpendControl struct {
@@ -44,17 +44,17 @@ type usageSpendControl struct {
 }
 
 type usageResponse struct {
-	UserID               string              `json:"user_id,omitempty"`
-	AccountID            string              `json:"account_id,omitempty"`
-	Email                string              `json:"email,omitempty"`
-	PlanType             string              `json:"plan_type,omitempty"`
-	RateLimit            usageRateLimit      `json:"rate_limit"`
-	CodeReviewRateLimit  any                 `json:"code_review_rate_limit"`
-	AdditionalRateLimits []any               `json:"additional_rate_limits"`
-	Credits              usageCredits        `json:"credits"`
-	SpendControl         usageSpendControl   `json:"spend_control"`
-	RateLimitReachedType any                 `json:"rate_limit_reached_type"`
-	Promo                any                 `json:"promo"`
+	UserID               string            `json:"user_id,omitempty"`
+	AccountID            string            `json:"account_id,omitempty"`
+	Email                string            `json:"email,omitempty"`
+	PlanType             string            `json:"plan_type,omitempty"`
+	RateLimit            usageRateLimit    `json:"rate_limit"`
+	CodeReviewRateLimit  any               `json:"code_review_rate_limit"`
+	AdditionalRateLimits []any             `json:"additional_rate_limits"`
+	Credits              usageCredits      `json:"credits"`
+	SpendControl         usageSpendControl `json:"spend_control"`
+	RateLimitReachedType any               `json:"rate_limit_reached_type"`
+	Promo                any               `json:"promo"`
 }
 
 type upstreamStatusError struct {
@@ -217,9 +217,6 @@ func aggregateUsageWindow(accounts []AccountStatus, now time.Time, extract func(
 	count := 0
 	earliestReset := int64(0)
 	for _, account := range accounts {
-		if !account.Enabled || account.DisabledReason != "" || !account.Healthy {
-			continue
-		}
 		usedPercent, resetAt := extract(account)
 		if usedPercent < 0 {
 			continue
@@ -228,19 +225,6 @@ func aggregateUsageWindow(accounts []AccountStatus, now time.Time, extract func(
 		count++
 		if resetAt > now.Unix() && (earliestReset == 0 || resetAt < earliestReset) {
 			earliestReset = resetAt
-		}
-	}
-	if count == 0 {
-		for _, account := range accounts {
-			usedPercent, resetAt := extract(account)
-			if usedPercent < 0 {
-				continue
-			}
-			total += usedPercent
-			count++
-			if resetAt > now.Unix() && (earliestReset == 0 || resetAt < earliestReset) {
-				earliestReset = resetAt
-			}
 		}
 	}
 	if count == 0 {

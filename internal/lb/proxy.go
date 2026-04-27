@@ -182,7 +182,7 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.expireCooldowns(now)
 	p.expireChildProxyCooldowns(now)
 	p.maybeRefreshQuota(r.Context(), now, false)
-	if p.handleAggregatedUsageForProxyOnly(w, r, now, reqID) {
+	if p.handleAggregatedUsage(w, r, now, reqID) {
 		return
 	}
 
@@ -193,14 +193,11 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.handleHTTP(w, r, now, reqID)
 }
 
-func (p *ProxyServer) handleAggregatedUsageForProxyOnly(w http.ResponseWriter, r *http.Request, now time.Time, reqID uint64) bool {
+func (p *ProxyServer) handleAggregatedUsage(w http.ResponseWriter, r *http.Request, now time.Time, reqID uint64) bool {
 	if r.Method != http.MethodGet {
 		return false
 	}
 	if r.URL.Path != "/backend-api/wham/usage" && r.URL.Path != "/api/codex/usage" && r.URL.Path != "/usage" {
-		return false
-	}
-	if !isProxyOnlyRuntimeAuthRequest(r.Header.Get("Authorization")) {
 		return false
 	}
 
@@ -217,7 +214,7 @@ func (p *ProxyServer) handleAggregatedUsageForProxyOnly(w http.ResponseWriter, r
 		"req_id": reqID,
 		"status": http.StatusOK,
 		"path":   r.URL.Path,
-		"mode":   "aggregated-proxy-only-usage",
+		"mode":   "aggregated-usage",
 	})
 	return true
 }
