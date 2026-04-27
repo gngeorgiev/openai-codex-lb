@@ -46,6 +46,33 @@ func TestRewriteForBackendV1ResponsesCompact(t *testing.T) {
 	}
 }
 
+func TestRewriteForBackendApps(t *testing.T) {
+	t.Parallel()
+	src, _ := url.Parse("http://127.0.0.1:8765/api/codex/apps?session=1")
+	next, err := rewriteForAccount(src, "https://chatgpt.com/backend-api")
+	if err != nil {
+		t.Fatalf("rewriteForAccount: %v", err)
+	}
+	if got, want := next.Path, "/backend-api/wham/apps"; got != want {
+		t.Fatalf("path mismatch: got %q want %q", got, want)
+	}
+	if got, want := next.RawQuery, "session=1"; got != want {
+		t.Fatalf("query mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestRewriteForBackendAppsSuffix(t *testing.T) {
+	t.Parallel()
+	src, _ := url.Parse("http://127.0.0.1:8765/api/codex/apps/oauth/register")
+	next, err := rewriteForAccount(src, "https://chatgpt.com/backend-api")
+	if err != nil {
+		t.Fatalf("rewriteForAccount: %v", err)
+	}
+	if got, want := next.Path, "/backend-api/wham/apps/oauth/register"; got != want {
+		t.Fatalf("path mismatch: got %q want %q", got, want)
+	}
+}
+
 func TestSetAccountHeaders(t *testing.T) {
 	t.Parallel()
 	h := http.Header{}

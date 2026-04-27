@@ -30,6 +30,8 @@ func rewriteForAccount(src *url.URL, baseURL string) (*url.URL, error) {
 		}
 		if responsePathSuffix, ok := accountResponsesSuffix(sourcePath); ok {
 			next.Path = codexPrefix + "/responses" + responsePathSuffix
+		} else if appsPathSuffix, ok := accountAppsSuffix(sourcePath); ok {
+			next.Path = basePath + "/wham/apps" + appsPathSuffix
 		} else if strings.Contains(sourcePath, "/chat/completions") {
 			next.Path = codexPrefix + "/responses"
 		} else {
@@ -107,6 +109,20 @@ func accountResponsesSuffix(requestPath string) (string, bool) {
 	case strings.Contains(requestPath, "/v1/responses"):
 		suffix, ok := strings.CutPrefix(requestPath, "/v1/responses")
 		return suffix, ok
+	default:
+		return "", false
+	}
+}
+
+func accountAppsSuffix(requestPath string) (string, bool) {
+	requestPath = strings.ToLower(requestPath)
+	switch {
+	case requestPath == "/api/codex/apps":
+		return "", true
+	case requestPath == "/api/codex/apps/":
+		return "/", true
+	case strings.HasPrefix(requestPath, "/api/codex/apps/"):
+		return strings.TrimPrefix(requestPath, "/api/codex/apps"), true
 	default:
 		return "", false
 	}

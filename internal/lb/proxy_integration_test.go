@@ -102,6 +102,79 @@ func TestProxySelectsAccountByUsage(t *testing.T) {
 	}
 }
 
+func TestProxyRewritesCodexAppsForBackendAccounts(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	token := testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-a"},
+		"https://api.openai.com/profile": map[string]any{"email": "a@example.com"},
+	})
+	home := filepath.Join(tmp, "acc-a")
+	writeAuthFile(t, home, token, "acct-a")
+
+	var hitPath string
+	var hitAuth string
+	var hitAccountID string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/backend-api/wham/usage" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"rate_limit":{"primary_window":{"used_percent":10},"secondary_window":{"used_percent":10}}}`)
+			return
+		}
+		hitPath = r.URL.RequestURI()
+		hitAuth = r.Header.Get("Authorization")
+		hitAccountID = r.Header.Get("ChatGPT-Account-Id")
+		if r.URL.Path != "/backend-api/wham/apps" {
+			t.Fatalf("unexpected upstream path %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","result":{"ok":true},"id":1}`)
+	}))
+	defer upstream.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.UpstreamBaseURL = upstream.URL + "/backend-api"
+		sf.Accounts = []Account{
+			{ID: "a", Alias: "a", HomeDir: home, BaseURL: sf.Settings.Proxy.UpstreamBaseURL, Enabled: true},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxySrv := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer proxySrv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/api/codex/apps?session=abc", bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post to proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	if got, want := hitPath, "/backend-api/wham/apps?session=abc"; got != want {
+		t.Fatalf("upstream request uri mismatch: got %q want %q", got, want)
+	}
+	if got, want := hitAuth, "Bearer "+token; got != want {
+		t.Fatalf("authorization mismatch: got %q want %q", got, want)
+	}
+	if got, want := hitAccountID, "acct-a"; got != want {
+		t.Fatalf("account id mismatch: got %q want %q", got, want)
+	}
+}
+
 func TestProxyReturnsAggregatedUsageForProxyOnlyRuntimeAuth(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
