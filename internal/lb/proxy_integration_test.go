@@ -1133,6 +1133,108 @@ func TestProxyRefreshesAccountOn401AndRetries(t *testing.T) {
 	}
 }
 
+func TestProxyRuntimeOAuthTokenRefreshUsesSyntheticRefreshToken(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	oldToken := testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-a"},
+	})
+	newToken := testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-a"},
+		"https://api.openai.com/profile": map[string]any{"email": "real@example.com"},
+	})
+	home := filepath.Join(tmp, "acc-a")
+	writeAuthTokensFile(t, home, oldToken, "refresh-a-1", "acct-a")
+
+	authSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm: %v", err)
+		}
+		if got := r.Form.Get("refresh_token"); got != "refresh-a-1" {
+			t.Fatalf("unexpected refresh token: %q", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  newToken,
+			"refresh_token": "refresh-a-2",
+			"id_token": testJWT(map[string]any{
+				"email": "real@example.com",
+				"https://api.openai.com/auth": map[string]any{
+					"chatgpt_account_id": "acct-a",
+					"chatgpt_plan_type":  "plus",
+				},
+				"https://api.openai.com/profile": map[string]any{
+					"email": "real@example.com",
+				},
+			}),
+		})
+	}))
+	defer authSrv.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Accounts = []Account{
+			{ID: "openai:a", Alias: "a", HomeDir: home, Enabled: true},
+		}
+		sf.State.ActiveIndex = 0
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxy := NewProxyServer(store, nil, nil)
+	proxy.authTokenURL = authSrv.URL
+	proxy.authClientID = "client-123"
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	resp, err := http.PostForm(proxySrv.URL+"/oauth/token", url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {proxyRuntimeRefreshToken},
+	})
+	if err != nil {
+		t.Fatalf("post oauth token refresh: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d, body=%s", resp.StatusCode, string(body))
+	}
+
+	var payload oauthTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode oauth refresh payload: %v", err)
+	}
+	if payload.AccessToken != newToken {
+		t.Fatalf("unexpected access token in refresh response")
+	}
+	if payload.RefreshToken != proxyRuntimeRefreshToken {
+		t.Fatalf("expected synthetic refresh token %q, got %q", proxyRuntimeRefreshToken, payload.RefreshToken)
+	}
+	claims, err := decodeJWTPayload(payload.IDToken)
+	if err != nil {
+		t.Fatalf("decode masked id token: %v", err)
+	}
+	if got := stringField(claims["email"]); got != "proxy-only@codexlb.internal" {
+		t.Fatalf("masked id token email = %q", got)
+	}
+
+	authInfo, err := LoadAuth(home)
+	if err != nil {
+		t.Fatalf("LoadAuth after runtime refresh: %v", err)
+	}
+	if authInfo.AccessToken != newToken {
+		t.Fatalf("expected refreshed access token to persist")
+	}
+	if authInfo.RefreshToken != "refresh-a-2" {
+		t.Fatalf("expected rotated account refresh token, got %q", authInfo.RefreshToken)
+	}
+}
+
 func TestProxyMarksTerminalRefreshFailureAndClearsPin(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

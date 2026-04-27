@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gngeorgiev/openai-codex-lb/internal/lb"
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 func TestE2EWrapperLoginAndRun(t *testing.T) {
@@ -104,8 +105,15 @@ func TestE2EWrapperRunSeedsRuntimeConfigFromUserCodexHome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read runtime config.toml: %v", err)
 	}
-	if string(gotConfig) != string(wantConfig) {
-		t.Fatalf("runtime config.toml = %q, want %q", string(gotConfig), string(wantConfig))
+	var cfg map[string]any
+	if err := toml.Unmarshal(gotConfig, &cfg); err != nil {
+		t.Fatalf("parse runtime config.toml: %v", err)
+	}
+	if got := cfg["model"]; got != "gpt-5.4" {
+		t.Fatalf("runtime model = %#v, want %q", got, "gpt-5.4")
+	}
+	if got := cfg["chatgpt_base_url"]; got != "http://127.0.0.1:9876" {
+		t.Fatalf("runtime chatgpt_base_url = %#v, want %q", got, "http://127.0.0.1:9876")
 	}
 }
 

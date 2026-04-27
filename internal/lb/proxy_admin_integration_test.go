@@ -79,8 +79,8 @@ func TestProxyAdminImportListPinUnpinRemove(t *testing.T) {
 	if got := stringField(claims["email"]); got != "proxy-only@codexlb.internal" {
 		t.Fatalf("expected runtime id_token email to be proxy-only, got %q", got)
 	}
-	if runtimeAuthPayload.Tokens.Refresh != runtimeAuthPayload.Tokens.Access {
-		t.Fatalf("expected normalized refresh_token to match access_token")
+	if runtimeAuthPayload.Tokens.Refresh != proxyRuntimeRefreshToken {
+		t.Fatalf("expected runtime refresh_token %q, got %q", proxyRuntimeRefreshToken, runtimeAuthPayload.Tokens.Refresh)
 	}
 	if runtimeAuthResp.SourceAlias != "alice" {
 		t.Fatalf("expected source alias alice, got %q", runtimeAuthResp.SourceAlias)

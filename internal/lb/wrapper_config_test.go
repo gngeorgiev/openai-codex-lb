@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 func TestResolveCodexInvocationUsesRunProxyURLFromConfig(t *testing.T) {
@@ -39,6 +41,9 @@ inherit_shell = false
 	_, _, _, env, inheritShell := resolveCodexInvocation(store, "", "", "", nil)
 	if env["OPENAI_BASE_URL"] != "http://127.0.0.1:19000" {
 		t.Fatalf("OPENAI_BASE_URL = %q, want %q", env["OPENAI_BASE_URL"], "http://127.0.0.1:19000")
+	}
+	if env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"] != "http://127.0.0.1:19000/oauth/token" {
+		t.Fatalf("CODEX_REFRESH_TOKEN_URL_OVERRIDE = %q", env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"])
 	}
 	if inheritShell {
 		t.Fatalf("inheritShell = true, want false")
@@ -122,6 +127,56 @@ func TestEnsureRuntimeAuthRewritesStoreRuntimeHome(t *testing.T) {
 	}
 	if auth.UserEmail != "proxy-only@codexlb.internal" {
 		t.Fatalf("expected proxy-only email, got %q", auth.UserEmail)
+	}
+}
+
+func TestEnsureRuntimeAuthStripsPersistedRuntimeRateLimits(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	runtimeHome := store.RuntimeDir()
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatalf("mkdir runtime home: %v", err)
+	}
+	writeAuthForTest(t, runtimeHome, "acct-old", "old@example.com")
+
+	rolloutDir := filepath.Join(runtimeHome, "sessions", "2026", "04", "27")
+	if err := os.MkdirAll(rolloutDir, 0o700); err != nil {
+		t.Fatalf("mkdir rollout dir: %v", err)
+	}
+	rolloutPath := filepath.Join(rolloutDir, "rollout.jsonl")
+	rollout := strings.Join([]string{
+		`{"timestamp":"2026-04-27T14:00:00Z","type":"session_meta","payload":{"id":"thread-1"}}`,
+		`{"timestamp":"2026-04-27T14:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":123}},"rate_limits":{"limit_id":"codex","primary":{"used_percent":99.0}}}}`,
+		`{"timestamp":"2026-04-27T14:00:02Z","type":"event_msg","payload":{"type":"warning","message":"keep me"}}`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(rolloutPath, []byte(rollout), 0o600); err != nil {
+		t.Fatalf("write rollout: %v", err)
+	}
+
+	if err := EnsureRuntimeAuth(store, ""); err != nil {
+		t.Fatalf("EnsureRuntimeAuth: %v", err)
+	}
+
+	raw, err := os.ReadFile(rolloutPath)
+	if err != nil {
+		t.Fatalf("read rollout: %v", err)
+	}
+	text := string(raw)
+	if strings.Contains(text, `"used_percent":99.0`) {
+		t.Fatalf("expected persisted rate limits to be stripped, got %s", text)
+	}
+	if !strings.Contains(text, `"rate_limits":null`) {
+		t.Fatalf("expected persisted rate limits to be nulled, got %s", text)
+	}
+	if !strings.Contains(text, `"message":"keep me"`) {
+		t.Fatalf("expected non-token-count events to remain, got %s", text)
 	}
 }
 
@@ -315,8 +370,8 @@ func TestSeedRuntimeAuthIfMissingFetchesFromRemoteProxy(t *testing.T) {
 	if got, _ := tokens["account_id"].(string); got != "proxy-only" {
 		t.Fatalf("unexpected account_id: %q", got)
 	}
-	if got, _ := tokens["refresh_token"].(string); got != accessToken {
-		t.Fatalf("expected refresh_token to match access_token, got %q want %q", got, accessToken)
+	if got, _ := tokens["refresh_token"].(string); got != proxyRuntimeRefreshToken {
+		t.Fatalf("expected refresh_token override %q, got %q", proxyRuntimeRefreshToken, got)
 	}
 }
 
@@ -379,8 +434,8 @@ func TestSeedRuntimeAuthIfMissingMasksRemoteRuntimeIDTokenDisplayForRealAccount(
 	if got, _ := tokens["account_id"].(string); got != "acct-remote" {
 		t.Fatalf("tokens.account_id = %q, want acct-remote", got)
 	}
-	if got, _ := tokens["refresh_token"].(string); got != "refresh-remote" {
-		t.Fatalf("tokens.refresh_token = %q, want refresh-remote", got)
+	if got, _ := tokens["refresh_token"].(string); got != proxyRuntimeRefreshToken {
+		t.Fatalf("tokens.refresh_token = %q, want %q", got, proxyRuntimeRefreshToken)
 	}
 	maskedIDToken, _ := tokens["id_token"].(string)
 	if maskedIDToken == idToken {
@@ -437,8 +492,12 @@ func TestSeedRuntimeAuthIfMissingCopiesRemoteRuntimeConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read runtime config.toml: %v", err)
 	}
-	if string(gotConfig) != wantConfig {
-		t.Fatalf("runtime config.toml = %q, want %q", string(gotConfig), wantConfig)
+	cfg := parseRuntimeConfigTOML(t, gotConfig)
+	if got := stringConfigValue(t, cfg, "model"); got != "gpt-5.2-codex" {
+		t.Fatalf("runtime model = %q, want %q", got, "gpt-5.2-codex")
+	}
+	if got := stringConfigValue(t, cfg, "chatgpt_base_url"); got != server.URL {
+		t.Fatalf("runtime chatgpt_base_url = %q, want %q", got, server.URL)
 	}
 }
 
@@ -489,8 +548,9 @@ func TestSeedRuntimeAuthIfMissingCopiesUserConfigWhenAccountConfigMissing(t *tes
 	if err != nil {
 		t.Fatalf("read runtime config.toml: %v", err)
 	}
-	if string(gotConfig) != string(wantConfig) {
-		t.Fatalf("runtime config.toml = %q, want %q", string(gotConfig), string(wantConfig))
+	cfg := parseRuntimeConfigTOML(t, gotConfig)
+	if got := stringConfigValue(t, cfg, "model"); got != "gpt-5.4" {
+		t.Fatalf("runtime model = %q, want %q", got, "gpt-5.4")
 	}
 }
 
@@ -544,8 +604,9 @@ func TestSeedRuntimeAuthIfMissingPrefersAccountConfigOverUserConfig(t *testing.T
 	if err != nil {
 		t.Fatalf("read runtime config.toml: %v", err)
 	}
-	if string(gotConfig) != string(wantConfig) {
-		t.Fatalf("runtime config.toml = %q, want %q", string(gotConfig), string(wantConfig))
+	cfg := parseRuntimeConfigTOML(t, gotConfig)
+	if got := stringConfigValue(t, cfg, "model"); got != "gpt-5.2-codex" {
+		t.Fatalf("runtime model = %q, want %q", got, "gpt-5.2-codex")
 	}
 }
 
@@ -614,8 +675,54 @@ func TestSeedRuntimeAuthIfMissingDoesNotBorrowDifferentAccountConfig(t *testing.
 	if err != nil {
 		t.Fatalf("read runtime config.toml: %v", err)
 	}
-	if string(gotConfig) != string(fallbackConfig) {
-		t.Fatalf("runtime config.toml = %q, want fallback %q", string(gotConfig), string(fallbackConfig))
+	cfg := parseRuntimeConfigTOML(t, gotConfig)
+	if got := stringConfigValue(t, cfg, "model"); got != "gpt-5.4" {
+		t.Fatalf("runtime model = %q, want %q", got, "gpt-5.4")
+	}
+}
+
+func TestSeedRuntimeAuthIfMissingSetsProxyChatGPTBaseURLWithoutSourceConfig(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("CODEX_HOME", "")
+
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	accountHome := filepath.Join(root, "acc-a")
+	if err := os.MkdirAll(accountHome, 0o700); err != nil {
+		t.Fatalf("mkdir account home: %v", err)
+	}
+	writeAuthForTest(t, accountHome, "acct-a", "a@example.com")
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Accounts = []Account{
+			{Alias: "a", ID: "openai:a", HomeDir: accountHome, Enabled: true},
+		}
+		sf.State.ActiveIndex = 0
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	runtimeHome := filepath.Join(root, "runtime-proxy-config")
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatalf("mkdir runtime home: %v", err)
+	}
+	proxyURL := "http://codexlb.internal/"
+	if err := seedRuntimeAuthIfMissing(store, runtimeHome, proxyURL); err != nil {
+		t.Fatalf("seedRuntimeAuthIfMissing: %v", err)
+	}
+
+	gotConfig, err := os.ReadFile(filepath.Join(runtimeHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read runtime config.toml: %v", err)
+	}
+	cfg := parseRuntimeConfigTOML(t, gotConfig)
+	if got := stringConfigValue(t, cfg, "chatgpt_base_url"); got != "http://codexlb.internal" {
+		t.Fatalf("runtime chatgpt_base_url = %q, want %q", got, "http://codexlb.internal")
 	}
 }
 
@@ -639,4 +746,26 @@ func writeAuthForTest(t *testing.T, home, accountID, email string) {
 	if err := os.WriteFile(filepath.Join(home, "auth.json"), b, 0o600); err != nil {
 		t.Fatalf("write auth.json for %s: %v", home, err)
 	}
+}
+
+func parseRuntimeConfigTOML(t *testing.T, data []byte) map[string]any {
+	t.Helper()
+	var cfg map[string]any
+	if err := toml.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("parse runtime config.toml: %v", err)
+	}
+	return cfg
+}
+
+func stringConfigValue(t *testing.T, cfg map[string]any, key string) string {
+	t.Helper()
+	value, ok := cfg[key]
+	if !ok {
+		t.Fatalf("missing config key %q in %#v", key, cfg)
+	}
+	s, ok := value.(string)
+	if !ok {
+		t.Fatalf("config key %q has type %T, want string", key, value)
+	}
+	return s
 }

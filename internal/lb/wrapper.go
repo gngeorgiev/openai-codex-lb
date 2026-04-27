@@ -1,6 +1,7 @@
 package lb
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	toml "github.com/pelletier/go-toml/v2"
 )
 
 var aliasRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$`)
@@ -236,6 +239,9 @@ func resolveCodexInvocation(store *Store, codexBin, proxyURL, codexHome string, 
 		"OPENAI_BASE_URL": proxyURL,
 		"CODEX_HOME":      codexHome,
 	}
+	if refreshURL := runtimeRefreshTokenURLOverride(proxyURL); refreshURL != "" {
+		env["CODEX_REFRESH_TOKEN_URL_OVERRIDE"] = refreshURL
+	}
 	if os.Getenv("OPENAI_API_KEY") == "" {
 		env["OPENAI_API_KEY"] = "codex-lb-local-key"
 	}
@@ -253,7 +259,125 @@ func ensureRuntimeAuth(store *Store, codexHome, proxyURL string) error {
 	if err := seedRuntimeAuthIfMissing(store, codexHome, proxyURL); err != nil {
 		return err
 	}
+	if err := sanitizeRuntimeRateLimitState(codexHome); err != nil {
+		return fmt.Errorf("sanitize runtime rate limits: %w", err)
+	}
 	return nil
+}
+
+func sanitizeRuntimeRateLimitState(codexHome string) error {
+	sessionsDir := filepath.Join(codexHome, "sessions")
+	info, err := os.Stat(sessionsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+
+	return filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !d.Type().IsRegular() || !strings.HasSuffix(strings.ToLower(d.Name()), ".jsonl") {
+			return nil
+		}
+		return stripPersistedRateLimitsFromRollout(path)
+	})
+}
+
+func stripPersistedRateLimitsFromRollout(path string) error {
+	in, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmpPath := path + ".tmp"
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+
+	reader := bufio.NewReader(in)
+	changed := false
+	writeErr := func(err error) error {
+		_ = out.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			updated, lineChanged, err := stripRateLimitsFromRolloutLine(line)
+			if err != nil {
+				return writeErr(err)
+			}
+			if lineChanged {
+				changed = true
+				line = updated
+			}
+			if _, err := out.Write(line); err != nil {
+				return writeErr(err)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return writeErr(readErr)
+		}
+	}
+
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if !changed {
+		_ = os.Remove(tmpPath)
+		return nil
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func stripRateLimitsFromRolloutLine(line []byte) ([]byte, bool, error) {
+	trimmed := strings.TrimSpace(string(line))
+	if trimmed == "" ||
+		!strings.Contains(trimmed, `"type":"event_msg"`) ||
+		!strings.Contains(trimmed, `"type":"token_count"`) ||
+		!strings.Contains(trimmed, `"rate_limits"`) {
+		return line, false, nil
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &entry); err != nil {
+		return line, false, nil
+	}
+	if stringField(entry["type"]) != "event_msg" {
+		return line, false, nil
+	}
+	payload, _ := entry["payload"].(map[string]any)
+	if payload == nil || stringField(payload["type"]) != "token_count" {
+		return line, false, nil
+	}
+	if _, ok := payload["rate_limits"]; !ok {
+		return line, false, nil
+	}
+
+	payload["rate_limits"] = nil
+	entry["payload"] = payload
+	updated, err := json.Marshal(entry)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		updated = append(updated, '\n')
+	}
+	return updated, true, nil
 }
 
 func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
@@ -269,7 +393,7 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 
 		for _, idx := range candidates {
 			account := snapshot.Accounts[idx]
-			payload, err := normalizedRuntimeAuthPayloadFromHome(account.HomeDir, account.ChatGPTAccountID)
+			payload, err := normalizedRuntimeAuthPayloadFromHome(account.HomeDir, account.ChatGPTAccountID, runtimeRefreshTokenOverride(proxyURL))
 			if err != nil {
 				lastErr = err
 				continue
@@ -277,7 +401,7 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 			if err := os.WriteFile(targetAuth, payload, 0o600); err != nil {
 				return fmt.Errorf("write runtime auth.json from account %s: %w", account.Alias, err)
 			}
-			if err := syncRuntimeConfigForAccount(snapshot, idx, codexHome); err != nil {
+			if err := syncRuntimeConfigForAccount(snapshot, idx, codexHome, proxyURL); err != nil {
 				return err
 			}
 			return nil
@@ -288,20 +412,20 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 	}
 
 	if remoteAuth, err := fetchRemoteRuntimeAuth(proxyURL); err == nil {
-		payload, err := normalizeRuntimeAuthPayload(remoteAuth.Auth, "")
+		payload, err := normalizeRuntimeAuthPayload(remoteAuth.Auth, "", runtimeRefreshTokenOverride(proxyURL))
 		if err != nil {
 			return fmt.Errorf("normalize remote runtime auth payload: %w", err)
 		}
 		if err := os.WriteFile(targetAuth, payload, 0o600); err != nil {
 			return fmt.Errorf("write runtime auth.json from remote runtime auth: %w", err)
 		}
-		if err := syncRuntimeConfigFromRemote(remoteAuth, codexHome); err != nil {
+		if err := syncRuntimeConfigFromRemote(remoteAuth, codexHome, proxyURL); err != nil {
 			return err
 		}
 		return nil
 	}
 
-	if err := syncDefaultRuntimeConfig(codexHome); err != nil {
+	if err := syncDefaultRuntimeConfig(codexHome, proxyURL); err != nil {
 		return err
 	}
 	if err := writeProxyOnlyRuntimeAuth(targetAuth); err != nil {
@@ -310,47 +434,73 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 	return nil
 }
 
-func syncRuntimeConfigForAccount(snapshot StoreFile, accountIdx int, codexHome string) error {
+func syncRuntimeConfigForAccount(snapshot StoreFile, accountIdx int, codexHome, proxyURL string) error {
 	if accountIdx >= 0 && accountIdx < len(snapshot.Accounts) {
 		sourceConfig := filepath.Join(snapshot.Accounts[accountIdx].HomeDir, "config.toml")
 		if isRegularFile(sourceConfig) {
-			return copyRuntimeConfigFile(sourceConfig, codexHome, fmt.Sprintf("account %s", snapshot.Accounts[accountIdx].Alias))
+			return copyRuntimeConfigFile(sourceConfig, codexHome, fmt.Sprintf("account %s", snapshot.Accounts[accountIdx].Alias), proxyURL)
 		}
 	}
-	return syncDefaultRuntimeConfig(codexHome)
+	return syncDefaultRuntimeConfig(codexHome, proxyURL)
 }
 
-func syncRuntimeConfigFromRemote(runtimeAuth AdminRuntimeAuthResponse, codexHome string) error {
+func syncRuntimeConfigFromRemote(runtimeAuth AdminRuntimeAuthResponse, codexHome, proxyURL string) error {
 	if strings.TrimSpace(runtimeAuth.Config) != "" {
-		targetConfig := filepath.Join(codexHome, "config.toml")
-		if err := os.WriteFile(targetConfig, []byte(runtimeAuth.Config), 0o600); err != nil {
-			sourceDesc := "remote runtime auth"
-			if runtimeAuth.SourceAlias != "" {
-				sourceDesc = fmt.Sprintf("remote account %s", runtimeAuth.SourceAlias)
-			}
-			return fmt.Errorf("seed runtime config.toml from %s: %w", sourceDesc, err)
+		sourceDesc := "remote runtime auth"
+		if runtimeAuth.SourceAlias != "" {
+			sourceDesc = fmt.Sprintf("remote account %s", runtimeAuth.SourceAlias)
 		}
-		return nil
+		return writeRuntimeConfigBytes([]byte(runtimeAuth.Config), codexHome, sourceDesc, proxyURL)
 	}
-	return syncDefaultRuntimeConfig(codexHome)
+	return syncDefaultRuntimeConfig(codexHome, proxyURL)
 }
 
-func syncDefaultRuntimeConfig(codexHome string) error {
+func syncDefaultRuntimeConfig(codexHome, proxyURL string) error {
 	if sourceConfig := defaultCodexConfigPath(codexHome); sourceConfig != "" {
-		return copyRuntimeConfigFile(sourceConfig, codexHome, "default Codex home")
+		return copyRuntimeConfigFile(sourceConfig, codexHome, "default Codex home", proxyURL)
 	}
-	return nil
+	return writeRuntimeConfigBytes(nil, codexHome, "default runtime config", proxyURL)
 }
 
-func copyRuntimeConfigFile(sourceConfig, codexHome, sourceDesc string) error {
-	targetConfig := filepath.Join(codexHome, "config.toml")
-	if sameCleanPath(sourceConfig, targetConfig) {
+func copyRuntimeConfigFile(sourceConfig, codexHome, sourceDesc, proxyURL string) error {
+	data, err := os.ReadFile(sourceConfig)
+	if err != nil {
+		return fmt.Errorf("seed runtime config.toml from %s: %w", sourceDesc, err)
+	}
+	return writeRuntimeConfigBytes(data, codexHome, sourceDesc, proxyURL)
+}
+
+func writeRuntimeConfigBytes(source []byte, codexHome, sourceDesc, proxyURL string) error {
+	normalized, err := normalizeRuntimeConfigData(source, proxyURL)
+	if err != nil {
+		return fmt.Errorf("seed runtime config.toml from %s: %w", sourceDesc, err)
+	}
+	if len(normalized) == 0 {
 		return nil
 	}
-	if err := copyFile(sourceConfig, targetConfig, 0o600); err != nil {
+	targetConfig := filepath.Join(codexHome, "config.toml")
+	if err := os.WriteFile(targetConfig, normalized, 0o600); err != nil {
 		return fmt.Errorf("seed runtime config.toml from %s: %w", sourceDesc, err)
 	}
 	return nil
+}
+
+func normalizeRuntimeConfigData(source []byte, proxyURL string) ([]byte, error) {
+	trimmedProxyURL := strings.TrimRight(strings.TrimSpace(proxyURL), "/")
+	if len(source) == 0 && trimmedProxyURL == "" {
+		return nil, nil
+	}
+
+	cfg := map[string]any{}
+	if len(source) > 0 {
+		if err := toml.Unmarshal(source, &cfg); err != nil {
+			return nil, err
+		}
+	}
+	if trimmedProxyURL != "" {
+		cfg["chatgpt_base_url"] = trimmedProxyURL
+	}
+	return toml.Marshal(cfg)
 }
 
 func defaultCodexConfigPath(codexHome string) string {
@@ -412,7 +562,7 @@ func fetchRemoteRuntimeAuth(proxyURL string) (AdminRuntimeAuthResponse, error) {
 	if len(payload.Auth) == 0 {
 		return AdminRuntimeAuthResponse{}, fmt.Errorf("missing auth payload")
 	}
-	if _, err := normalizeRuntimeAuthPayload(payload.Auth, ""); err != nil {
+	if _, err := normalizeRuntimeAuthPayload(payload.Auth, "", ""); err != nil {
 		return AdminRuntimeAuthResponse{}, fmt.Errorf("runtime auth payload is invalid: %w", err)
 	}
 	return payload, nil
@@ -421,6 +571,8 @@ func fetchRemoteRuntimeAuth(proxyURL string) (AdminRuntimeAuthResponse, error) {
 type proxyOnlyRuntimeProfile struct {
 	PlanType string
 }
+
+const proxyRuntimeRefreshToken = "codexlb-runtime-refresh"
 
 func runtimeAuthCandidateIndexes(snapshot StoreFile, nowMS int64) []int {
 	candidates := make([]int, 0, len(snapshot.Accounts))
@@ -454,17 +606,39 @@ func writeProxyOnlyRuntimeAuth(path string) error {
 	return os.WriteFile(path, payload, 0o600)
 }
 
-func normalizedRuntimeAuthPayloadFromHome(homeDir, fallbackAccountID string) ([]byte, error) {
+func normalizedRuntimeAuthPayloadFromHome(homeDir, fallbackAccountID, refreshTokenOverride string) ([]byte, error) {
 	path := filepath.Join(homeDir, "auth.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	payload, err := normalizeRuntimeAuthPayload(raw, fallbackAccountID)
+	payload, err := normalizeRuntimeAuthPayload(raw, fallbackAccountID, refreshTokenOverride)
 	if err != nil {
 		return nil, fmt.Errorf("normalize %s: %w", path, err)
 	}
 	return payload, nil
+}
+
+func runtimeRefreshTokenResponseFromHome(homeDir, fallbackAccountID string) (oauthTokenResponse, error) {
+	payload, err := normalizedRuntimeAuthPayloadFromHome(homeDir, fallbackAccountID, proxyRuntimeRefreshToken)
+	if err != nil {
+		return oauthTokenResponse{}, err
+	}
+	var auth struct {
+		Tokens struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+			IDToken      string `json:"id_token"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(payload, &auth); err != nil {
+		return oauthTokenResponse{}, fmt.Errorf("parse normalized runtime auth payload: %w", err)
+	}
+	return oauthTokenResponse{
+		AccessToken:  auth.Tokens.AccessToken,
+		RefreshToken: auth.Tokens.RefreshToken,
+		IDToken:      auth.Tokens.IDToken,
+	}, nil
 }
 
 func proxyOnlyRuntimeAuthPayload(profile proxyOnlyRuntimeProfile) ([]byte, error) {
@@ -608,7 +782,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	return out.Close()
 }
 
-func normalizeRuntimeAuthPayload(raw []byte, fallbackAccountID string) ([]byte, error) {
+func normalizeRuntimeAuthPayload(raw []byte, fallbackAccountID, refreshTokenOverride string) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, fmt.Errorf("parse runtime auth payload: %w", err)
@@ -623,7 +797,9 @@ func normalizeRuntimeAuthPayload(raw []byte, fallbackAccountID string) ([]byte, 
 	if accessToken == "" {
 		return nil, fmt.Errorf("missing tokens.access_token")
 	}
-	if strings.TrimSpace(stringField(tokens["refresh_token"])) == "" {
+	if strings.TrimSpace(refreshTokenOverride) != "" {
+		tokens["refresh_token"] = refreshTokenOverride
+	} else if strings.TrimSpace(stringField(tokens["refresh_token"])) == "" {
 		tokens["refresh_token"] = accessToken
 	}
 	if strings.TrimSpace(stringField(tokens["id_token"])) == "" {
@@ -642,6 +818,21 @@ func normalizeRuntimeAuthPayload(raw []byte, fallbackAccountID string) ([]byte, 
 		return nil, fmt.Errorf("serialize runtime auth payload: %w", err)
 	}
 	return normalized, nil
+}
+
+func runtimeRefreshTokenOverride(proxyURL string) string {
+	if strings.TrimSpace(proxyURL) == "" {
+		return ""
+	}
+	return proxyRuntimeRefreshToken
+}
+
+func runtimeRefreshTokenURLOverride(proxyURL string) string {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return ""
+	}
+	return strings.TrimRight(proxyURL, "/") + "/oauth/token"
 }
 
 func stringField(v any) string {

@@ -149,6 +149,15 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if r.Method == http.MethodPost && r.URL.Path == "/oauth/token" {
+		status := p.handleRuntimeOAuthToken(w, r)
+		p.logEvent("request.completed", map[string]any{
+			"req_id": reqID,
+			"status": status,
+			"path":   r.URL.Path,
+		})
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/admin/") {
 		status := p.handleAdmin(w, r)
 		p.logEvent("request.completed", map[string]any{
@@ -246,7 +255,7 @@ func (p *ProxyServer) handleAdmin(w http.ResponseWriter, r *http.Request) int {
 			return http.StatusInternalServerError
 		}
 		account := snapshot.Accounts[sel.Index]
-		authPayload, err := normalizedRuntimeAuthPayloadFromHome(account.HomeDir, account.ChatGPTAccountID)
+		authPayload, err := normalizedRuntimeAuthPayloadFromHome(account.HomeDir, account.ChatGPTAccountID, proxyRuntimeRefreshToken)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("load runtime auth for %s: %v", account.Alias, err))
 			return http.StatusInternalServerError
@@ -1422,6 +1431,52 @@ func (p *ProxyServer) tryRefreshAccountAuth(ctx context.Context, account Account
 		"mode":       "token-refresh",
 	})
 	return refreshed, true, nil
+}
+
+func (p *ProxyServer) handleRuntimeOAuthToken(w http.ResponseWriter, r *http.Request) int {
+	if err := r.ParseForm(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("parse oauth token request: %v", err))
+		return http.StatusBadRequest
+	}
+	if grantType := strings.TrimSpace(r.Form.Get("grant_type")); grantType != "" && grantType != "refresh_token" {
+		writeJSONError(w, http.StatusBadRequest, "unsupported grant_type")
+		return http.StatusBadRequest
+	}
+	if got := strings.TrimSpace(r.Form.Get("refresh_token")); got != proxyRuntimeRefreshToken {
+		writeJSONError(w, http.StatusUnauthorized, "invalid runtime refresh token")
+		return http.StatusUnauthorized
+	}
+
+	snapshot := p.store.Snapshot()
+	candidates := runtimeAuthCandidateIndexes(snapshot, time.Now().UnixMilli())
+	var lastErr error
+	for _, idx := range candidates {
+		if idx < 0 || idx >= len(snapshot.Accounts) {
+			continue
+		}
+		account := snapshot.Accounts[idx]
+		if _, _, err := p.tryRefreshAccountAuth(r.Context(), account, AuthInfo{}); err != nil {
+			lastErr = err
+			if reason := disabledReasonForAuthFailure(http.StatusUnauthorized, err); reason != "" {
+				p.markDisabled(account.ID, reason)
+			}
+			continue
+		}
+		resp, err := runtimeRefreshTokenResponseFromHome(account.HomeDir, account.ChatGPTAccountID)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return http.StatusOK
+	}
+
+	if lastErr != nil {
+		writeJSONError(w, http.StatusUnauthorized, fmt.Sprintf("refresh runtime auth: %v", lastErr))
+		return http.StatusUnauthorized
+	}
+	writeJSONError(w, http.StatusNotFound, "no available account for runtime auth refresh")
+	return http.StatusNotFound
 }
 
 func (p *ProxyServer) handleLogs(w http.ResponseWriter, r *http.Request) {
