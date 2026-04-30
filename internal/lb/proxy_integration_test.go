@@ -769,6 +769,7 @@ func TestProxyRewritesLiveRateLimitSignalsToPooledUsage(t *testing.T) {
 			w.Header().Set("x-codex-spark-secondary-window-minutes", "10080")
 			w.Header().Set("x-codex-spark-secondary-reset-at", strconv.FormatInt(secondaryReset, 10))
 			_, _ = io.WriteString(w, "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"primary\":{\"used_percent\":75,\"window_minutes\":300,\"reset_at\":"+strconv.FormatInt(primaryReset, 10)+"},\"secondary\":{\"used_percent\":90,\"window_minutes\":10080,\"reset_at\":"+strconv.FormatInt(secondaryReset, 10)+"}},\"metered_limit_name\":\"codex\"}\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{\"limit_id\":\"codex\",\"limit_name\":null,\"primary\":{\"used_percent\":75,\"window_minutes\":300,\"resets_at\":"+strconv.FormatInt(primaryReset, 10)+"},\"secondary\":{\"used_percent\":90,\"window_minutes\":10080,\"resets_at\":"+strconv.FormatInt(secondaryReset, 10)+"},\"credits\":null,\"plan_type\":\"plus\",\"rate_limit_reached_type\":null}}}\n\n")
 			_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -856,19 +857,25 @@ func TestProxyRewritesLiveRateLimitSignalsToPooledUsage(t *testing.T) {
 	}
 	lines := strings.Split(string(body), "\n")
 	var rateLimitPayload map[string]any
+	var tokenCountPayload map[string]any
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
 		payload := strings.TrimPrefix(line, "data: ")
-		if !strings.Contains(payload, `"codex.rate_limits"`) {
+		if strings.Contains(payload, `"codex.rate_limits"`) {
+			if err := json.Unmarshal([]byte(payload), &rateLimitPayload); err != nil {
+				t.Fatalf("unmarshal rate limit payload: %v", err)
+			}
 			continue
 		}
-		if err := json.Unmarshal([]byte(payload), &rateLimitPayload); err != nil {
-			t.Fatalf("unmarshal rate limit payload: %v", err)
+		if strings.Contains(payload, `"token_count"`) {
+			if err := json.Unmarshal([]byte(payload), &tokenCountPayload); err != nil {
+				t.Fatalf("unmarshal token count payload: %v", err)
+			}
+			continue
 		}
-		break
 	}
 	if rateLimitPayload == nil {
 		t.Fatalf("expected rewritten codex.rate_limits SSE payload in %q", string(body))
@@ -887,6 +894,22 @@ func TestProxyRewritesLiveRateLimitSignalsToPooledUsage(t *testing.T) {
 	}
 	if got, ok := secondary["reset_at"].(float64); !ok || int64(got) != now.Add(20*time.Hour).Unix() {
 		t.Fatalf("secondary.reset_at = %#v, want %d", secondary["reset_at"], now.Add(20*time.Hour).Unix())
+	}
+	if tokenCountPayload == nil {
+		t.Fatalf("expected rewritten token_count payload in %q", string(body))
+	}
+	tokenPayload, _ := tokenCountPayload["payload"].(map[string]any)
+	tokenRateLimits, _ := tokenPayload["rate_limits"].(map[string]any)
+	tokenPrimary, _ := tokenRateLimits["primary"].(map[string]any)
+	tokenSecondary, _ := tokenRateLimits["secondary"].(map[string]any)
+	if got, ok := tokenPrimary["used_percent"].(float64); !ok || got != 50 {
+		t.Fatalf("token_count primary.used_percent = %#v, want 50", tokenPrimary["used_percent"])
+	}
+	if got, ok := tokenSecondary["used_percent"].(float64); !ok || got != 50 {
+		t.Fatalf("token_count secondary.used_percent = %#v, want 50", tokenSecondary["used_percent"])
+	}
+	if got, ok := tokenPrimary["resets_at"].(float64); !ok || int64(got) != now.Add(2*time.Hour).Unix() {
+		t.Fatalf("token_count primary.resets_at = %#v, want %d", tokenPrimary["resets_at"], now.Add(2*time.Hour).Unix())
 	}
 }
 
@@ -2663,6 +2686,7 @@ func TestProxyRewritesChildProxyLiveRateLimitSignalsToWholePool(t *testing.T) {
 			w.Header().Set("x-codex-secondary-window-minutes", "10080")
 			w.Header().Set("x-codex-secondary-reset-at", strconv.FormatInt(childWeeklyReset, 10))
 			_, _ = io.WriteString(w, "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"primary\":{\"used_percent\":3,\"window_minutes\":300,\"reset_at\":"+strconv.FormatInt(childDailyReset, 10)+"},\"secondary\":{\"used_percent\":23,\"window_minutes\":10080,\"reset_at\":"+strconv.FormatInt(childWeeklyReset, 10)+"}},\"metered_limit_name\":\"codex\"}\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{\"limit_id\":\"codex\",\"limit_name\":null,\"primary\":{\"used_percent\":3,\"window_minutes\":300,\"resets_at\":"+strconv.FormatInt(childDailyReset, 10)+"},\"secondary\":{\"used_percent\":23,\"window_minutes\":10080,\"resets_at\":"+strconv.FormatInt(childWeeklyReset, 10)+"},\"credits\":null,\"plan_type\":\"plus\",\"rate_limit_reached_type\":null}}}\n\n")
 			_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"source\":\"child\"}\n\n")
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -2727,15 +2751,24 @@ func TestProxyRewritesChildProxyLiveRateLimitSignalsToWholePool(t *testing.T) {
 		t.Fatalf("read response body: %v", err)
 	}
 	var rateLimitPayload map[string]any
+	var tokenCountPayload map[string]any
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") || !strings.Contains(line, `"codex.rate_limits"`) {
+		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &rateLimitPayload); err != nil {
-			t.Fatalf("unmarshal rate limit payload: %v", err)
+		payload := strings.TrimPrefix(line, "data: ")
+		if strings.Contains(payload, `"codex.rate_limits"`) {
+			if err := json.Unmarshal([]byte(payload), &rateLimitPayload); err != nil {
+				t.Fatalf("unmarshal rate limit payload: %v", err)
+			}
+			continue
 		}
-		break
+		if strings.Contains(payload, `"token_count"`) {
+			if err := json.Unmarshal([]byte(payload), &tokenCountPayload); err != nil {
+				t.Fatalf("unmarshal token count payload: %v", err)
+			}
+		}
 	}
 	if rateLimitPayload == nil {
 		t.Fatalf("expected codex.rate_limits payload in body=%q", string(body))
@@ -2754,6 +2787,22 @@ func TestProxyRewritesChildProxyLiveRateLimitSignalsToWholePool(t *testing.T) {
 	}
 	if got, ok := secondary["reset_at"].(float64); !ok || int64(got) != localWeeklyReset {
 		t.Fatalf("secondary.reset_at = %#v, want %d", secondary["reset_at"], localWeeklyReset)
+	}
+	if tokenCountPayload == nil {
+		t.Fatalf("expected token_count payload in body=%q", string(body))
+	}
+	tokenPayload, _ := tokenCountPayload["payload"].(map[string]any)
+	tokenRateLimits, _ := tokenPayload["rate_limits"].(map[string]any)
+	tokenPrimary, _ := tokenRateLimits["primary"].(map[string]any)
+	tokenSecondary, _ := tokenRateLimits["secondary"].(map[string]any)
+	if got, ok := tokenPrimary["used_percent"].(float64); !ok || got != 22 {
+		t.Fatalf("token_count primary.used_percent = %#v, want 22", tokenPrimary["used_percent"])
+	}
+	if got, ok := tokenSecondary["used_percent"].(float64); !ok || got != 42 {
+		t.Fatalf("token_count secondary.used_percent = %#v, want 42", tokenSecondary["used_percent"])
+	}
+	if got, ok := tokenPrimary["resets_at"].(float64); !ok || int64(got) != localDailyReset {
+		t.Fatalf("token_count primary.resets_at = %#v, want %d", tokenPrimary["resets_at"], localDailyReset)
 	}
 }
 

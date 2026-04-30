@@ -1802,7 +1802,7 @@ func rewriteRateLimitEventLine(line []byte, pooled usageResponse) []byte {
 		return line
 	}
 	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-	if payload == "" || !strings.Contains(payload, `"type"`) || !strings.Contains(payload, `codex.rate_limits`) {
+	if payload == "" || !strings.Contains(payload, `"type"`) || !strings.Contains(payload, `"rate_limits"`) {
 		return line
 	}
 	replacement, ok := pooledRateLimitEventPayload(payload, pooled)
@@ -1820,30 +1820,73 @@ func pooledRateLimitEventPayload(payload string, pooled usageResponse) ([]byte, 
 	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
 		return nil, false
 	}
-	if stringField(parsed["type"]) != "codex.rate_limits" {
+
+	rewritten := false
+	switch stringField(parsed["type"]) {
+	case "codex.rate_limits":
+		parsed["plan_type"] = pooled.PlanType
+		parsed["metered_limit_name"] = "codex"
+		parsed["limit_name"] = "codex"
+		parsed["rate_limits"] = map[string]any{
+			"primary": map[string]any{
+				"used_percent":   pooled.RateLimit.PrimaryWindow.UsedPercent,
+				"window_minutes": pooled.RateLimit.PrimaryWindow.LimitWindowSeconds / 60,
+				"reset_at":       pooled.RateLimit.PrimaryWindow.ResetsAt,
+			},
+			"secondary": map[string]any{
+				"used_percent":   pooled.RateLimit.SecondaryWindow.UsedPercent,
+				"window_minutes": pooled.RateLimit.SecondaryWindow.LimitWindowSeconds / 60,
+				"reset_at":       pooled.RateLimit.SecondaryWindow.ResetsAt,
+			},
+		}
+		rewritten = true
+	case "event_msg":
+		payload, _ := parsed["payload"].(map[string]any)
+		if payload == nil || stringField(payload["type"]) != "token_count" {
+			break
+		}
+		if _, ok := payload["rate_limits"]; !ok {
+			break
+		}
+		payload["rate_limits"] = pooledTokenCountRateLimits(pooled)
+		parsed["payload"] = payload
+		rewritten = true
+	case "token_count":
+		if _, ok := parsed["rate_limits"]; !ok {
+			break
+		}
+		parsed["rate_limits"] = pooledTokenCountRateLimits(pooled)
+		rewritten = true
+	}
+	if !rewritten {
 		return nil, false
 	}
 
-	parsed["plan_type"] = pooled.PlanType
-	parsed["metered_limit_name"] = "codex"
-	parsed["limit_name"] = "codex"
-	parsed["rate_limits"] = map[string]any{
-		"primary": map[string]any{
-			"used_percent":   pooled.RateLimit.PrimaryWindow.UsedPercent,
-			"window_minutes": pooled.RateLimit.PrimaryWindow.LimitWindowSeconds / 60,
-			"reset_at":       pooled.RateLimit.PrimaryWindow.ResetsAt,
-		},
-		"secondary": map[string]any{
-			"used_percent":   pooled.RateLimit.SecondaryWindow.UsedPercent,
-			"window_minutes": pooled.RateLimit.SecondaryWindow.LimitWindowSeconds / 60,
-			"reset_at":       pooled.RateLimit.SecondaryWindow.ResetsAt,
-		},
-	}
 	updated, err := json.Marshal(parsed)
 	if err != nil {
 		return nil, false
 	}
 	return []byte("data: " + string(updated)), true
+}
+
+func pooledTokenCountRateLimits(pooled usageResponse) map[string]any {
+	return map[string]any{
+		"limit_id":   "codex",
+		"limit_name": nil,
+		"primary": map[string]any{
+			"used_percent":   pooled.RateLimit.PrimaryWindow.UsedPercent,
+			"window_minutes": pooled.RateLimit.PrimaryWindow.LimitWindowSeconds / 60,
+			"resets_at":      pooled.RateLimit.PrimaryWindow.ResetsAt,
+		},
+		"secondary": map[string]any{
+			"used_percent":   pooled.RateLimit.SecondaryWindow.UsedPercent,
+			"window_minutes": pooled.RateLimit.SecondaryWindow.LimitWindowSeconds / 60,
+			"resets_at":      pooled.RateLimit.SecondaryWindow.ResetsAt,
+		},
+		"credits":                 nil,
+		"plan_type":               pooled.PlanType,
+		"rate_limit_reached_type": nil,
+	}
 }
 
 func cloneHeaders(src http.Header) http.Header {
