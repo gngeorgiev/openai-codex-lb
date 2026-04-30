@@ -1468,8 +1468,8 @@ func TestProxyRuntimeOAuthTokenRefreshUsesSyntheticRefreshToken(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		t.Fatalf("decode oauth refresh payload: %v", err)
 	}
-	if payload.AccessToken != newToken {
-		t.Fatalf("unexpected access token in refresh response")
+	if payload.AccessToken == newToken {
+		t.Fatalf("runtime refresh response leaked upstream access token")
 	}
 	if payload.RefreshToken != proxyRuntimeRefreshToken {
 		t.Fatalf("expected synthetic refresh token %q, got %q", proxyRuntimeRefreshToken, payload.RefreshToken)
@@ -1480,6 +1480,9 @@ func TestProxyRuntimeOAuthTokenRefreshUsesSyntheticRefreshToken(t *testing.T) {
 	}
 	if got := stringField(claims["email"]); got != "proxy-only@codexlb.internal" {
 		t.Fatalf("masked id token email = %q", got)
+	}
+	if got := nestedString(claims, "https://api.openai.com/auth", "chatgpt_account_id"); got != "proxy-only" {
+		t.Fatalf("masked id token account id = %q", got)
 	}
 
 	authInfo, err := LoadAuth(home)

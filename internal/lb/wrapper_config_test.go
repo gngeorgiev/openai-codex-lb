@@ -320,6 +320,83 @@ func TestSeedRuntimeAuthIfMissingMasksRuntimeIDTokenDisplayForRealAccount(t *tes
 	}
 }
 
+func TestSeedRuntimeAuthIfMissingUsesProxyOnlyAuthForLocalAccountWithProxyURL(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	accountHome := filepath.Join(root, "acc-a")
+	if err := os.MkdirAll(accountHome, 0o700); err != nil {
+		t.Fatalf("mkdir account home: %v", err)
+	}
+	writeAuthForTest(t, accountHome, "acct-a", "real@example.com")
+	accountRaw, err := os.ReadFile(filepath.Join(accountHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("read account auth: %v", err)
+	}
+	var accountPayload map[string]any
+	if err := json.Unmarshal(accountRaw, &accountPayload); err != nil {
+		t.Fatalf("unmarshal account auth: %v", err)
+	}
+	accountTokens, _ := accountPayload["tokens"].(map[string]any)
+	accountAccessToken, _ := accountTokens["access_token"].(string)
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Accounts = []Account{
+			{Alias: "a", ID: "openai:a", HomeDir: accountHome, Enabled: true},
+		}
+		sf.State.ActiveIndex = 0
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	runtimeHome := filepath.Join(root, "runtime-proxy-local")
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatalf("mkdir runtime home: %v", err)
+	}
+	if err := seedRuntimeAuthIfMissing(store, runtimeHome, "http://codexlb.internal"); err != nil {
+		t.Fatalf("seedRuntimeAuthIfMissing: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(runtimeHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("read runtime auth.json: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal runtime auth payload: %v", err)
+	}
+	tokens, _ := payload["tokens"].(map[string]any)
+	if got, _ := tokens["account_id"].(string); got != "proxy-only" {
+		t.Fatalf("tokens.account_id = %q, want proxy-only", got)
+	}
+	if got, _ := tokens["refresh_token"].(string); got != proxyRuntimeRefreshToken {
+		t.Fatalf("tokens.refresh_token = %q, want %q", got, proxyRuntimeRefreshToken)
+	}
+	runtimeAccessToken, _ := tokens["access_token"].(string)
+	if runtimeAccessToken == "" {
+		t.Fatalf("expected runtime access_token")
+	}
+	if runtimeAccessToken == accountAccessToken {
+		t.Fatalf("runtime access_token leaked account token")
+	}
+	auth, err := LoadAuth(runtimeHome)
+	if err != nil {
+		t.Fatalf("LoadAuth(runtime): %v", err)
+	}
+	if auth.ChatGPTAccountID != "proxy-only" {
+		t.Fatalf("runtime auth account id = %q, want proxy-only", auth.ChatGPTAccountID)
+	}
+	if auth.UserEmail != "proxy-only@codexlb.internal" {
+		t.Fatalf("runtime auth email = %q, want proxy-only", auth.UserEmail)
+	}
+}
+
 func TestSeedRuntimeAuthIfMissingFetchesFromRemoteProxy(t *testing.T) {
 	t.Parallel()
 
@@ -375,7 +452,7 @@ func TestSeedRuntimeAuthIfMissingFetchesFromRemoteProxy(t *testing.T) {
 	}
 }
 
-func TestSeedRuntimeAuthIfMissingMasksRemoteRuntimeIDTokenDisplayForRealAccount(t *testing.T) {
+func TestSeedRuntimeAuthIfMissingUsesProxyOnlyAuthForRemoteRealAccount(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
@@ -431,25 +508,35 @@ func TestSeedRuntimeAuthIfMissingMasksRemoteRuntimeIDTokenDisplayForRealAccount(
 		t.Fatalf("unmarshal runtime auth payload: %v", err)
 	}
 	tokens, _ := payload["tokens"].(map[string]any)
-	if got, _ := tokens["account_id"].(string); got != "acct-remote" {
-		t.Fatalf("tokens.account_id = %q, want acct-remote", got)
+	if got, _ := tokens["account_id"].(string); got != "proxy-only" {
+		t.Fatalf("tokens.account_id = %q, want proxy-only", got)
 	}
 	if got, _ := tokens["refresh_token"].(string); got != proxyRuntimeRefreshToken {
 		t.Fatalf("tokens.refresh_token = %q, want %q", got, proxyRuntimeRefreshToken)
 	}
-	maskedIDToken, _ := tokens["id_token"].(string)
-	if maskedIDToken == idToken {
-		t.Fatalf("expected remote runtime id_token to be rewritten for display")
+	runtimeAccessToken, _ := tokens["access_token"].(string)
+	if runtimeAccessToken == accessToken {
+		t.Fatalf("runtime access_token leaked remote upstream token")
 	}
-	idClaims, err := decodeJWTPayload(maskedIDToken)
+	runtimeIDToken, _ := tokens["id_token"].(string)
+	if runtimeIDToken == idToken {
+		t.Fatalf("runtime id_token leaked remote upstream token")
+	}
+	if runtimeIDToken != runtimeAccessToken {
+		t.Fatalf("runtime id_token should match proxy-only access_token")
+	}
+	idClaims, err := decodeJWTPayload(runtimeIDToken)
 	if err != nil {
-		t.Fatalf("decode masked remote id_token: %v", err)
+		t.Fatalf("decode runtime id_token: %v", err)
 	}
 	if got := stringField(idClaims["email"]); got != "proxy-only@codexlb.internal" {
-		t.Fatalf("masked remote id_token email = %q", got)
+		t.Fatalf("runtime id_token email = %q", got)
 	}
-	if got := nestedString(idClaims, "https://api.openai.com/auth", "chatgpt_account_id"); got != "acct-remote" {
-		t.Fatalf("masked remote id_token account id = %q", got)
+	if got := nestedString(idClaims, "https://api.openai.com/auth", "chatgpt_account_id"); got != "proxy-only" {
+		t.Fatalf("runtime id_token account id = %q", got)
+	}
+	if got := nestedString(idClaims, "https://api.openai.com/auth", "chatgpt_plan_type"); got != "plus" {
+		t.Fatalf("runtime id_token plan type = %q", got)
 	}
 }
 

@@ -706,14 +706,21 @@ func runtimeRefreshTokenResponseFromHome(homeDir, fallbackAccountID string) (oau
 }
 
 func proxyOnlyRuntimeAuthPayload(profile proxyOnlyRuntimeProfile) ([]byte, error) {
+	return proxyOnlyRuntimeAuthPayloadWithRefreshToken(profile, "")
+}
+
+func proxyOnlyRuntimeAuthPayloadWithRefreshToken(profile proxyOnlyRuntimeProfile, refreshToken string) ([]byte, error) {
 	token := buildProxyOnlyAccessToken(profile)
+	if strings.TrimSpace(refreshToken) == "" {
+		refreshToken = token
+	}
 	payload := map[string]any{
 		"auth_mode":      "chatgpt",
 		"OPENAI_API_KEY": nil,
 		"last_refresh":   time.Now().UTC().Format(time.RFC3339),
 		"tokens": map[string]any{
 			"access_token":  token,
-			"refresh_token": token,
+			"refresh_token": refreshToken,
 			"id_token":      token,
 			"account_id":    "proxy-only",
 		},
@@ -732,8 +739,9 @@ func buildProxyOnlyAccessToken(profile proxyOnlyRuntimeProfile) string {
 		planType = "plus"
 	}
 	payload := map[string]any{
-		"sub": "codexlb-proxy-only",
-		"exp": int64(4102444800),
+		"email": "proxy-only@codexlb.internal",
+		"sub":   "codexlb-proxy-only",
+		"exp":   int64(4102444800),
 		"https://api.openai.com/auth": map[string]any{
 			"chatgpt_account_id": "proxy-only",
 			"chatgpt_plan_type":  planType,
@@ -862,8 +870,9 @@ func normalizeRuntimeAuthPayload(raw []byte, fallbackAccountID, refreshTokenOver
 		return nil, fmt.Errorf("missing tokens.access_token")
 	}
 	if strings.TrimSpace(refreshTokenOverride) != "" {
-		tokens["refresh_token"] = refreshTokenOverride
-	} else if strings.TrimSpace(stringField(tokens["refresh_token"])) == "" {
+		return proxyOnlyRuntimeAuthPayloadWithRefreshToken(runtimeProxyOnlyProfileFromTokens(tokens), refreshTokenOverride)
+	}
+	if strings.TrimSpace(stringField(tokens["refresh_token"])) == "" {
 		tokens["refresh_token"] = accessToken
 	}
 	if strings.TrimSpace(stringField(tokens["id_token"])) == "" {
@@ -882,6 +891,19 @@ func normalizeRuntimeAuthPayload(raw []byte, fallbackAccountID, refreshTokenOver
 		return nil, fmt.Errorf("serialize runtime auth payload: %w", err)
 	}
 	return normalized, nil
+}
+
+func runtimeProxyOnlyProfileFromTokens(tokens map[string]any) proxyOnlyRuntimeProfile {
+	for _, key := range []string{"id_token", "access_token"} {
+		claims, err := decodeJWTPayload(strings.TrimSpace(stringField(tokens[key])))
+		if err != nil {
+			continue
+		}
+		if planType := nestedString(claims, "https://api.openai.com/auth", "chatgpt_plan_type"); planType != "" {
+			return proxyOnlyRuntimeProfile{PlanType: planType}
+		}
+	}
+	return proxyOnlyRuntimeProfile{}
 }
 
 func runtimeRefreshTokenOverride(proxyURL string) string {
