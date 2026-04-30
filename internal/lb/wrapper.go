@@ -2,6 +2,7 @@ package lb
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -252,6 +253,10 @@ func EnsureRuntimeAuth(store *Store, proxyURL string) error {
 	return ensureRuntimeAuth(store, store.RuntimeDir(), proxyURL)
 }
 
+func EnsureRuntimeAuthAt(store *Store, codexHome, proxyURL string) error {
+	return ensureRuntimeAuth(store, codexHome, proxyURL)
+}
+
 func ensureRuntimeAuth(store *Store, codexHome, proxyURL string) error {
 	if err := os.MkdirAll(codexHome, 0o700); err != nil {
 		return fmt.Errorf("create runtime CODEX_HOME: %w", err)
@@ -259,51 +264,168 @@ func ensureRuntimeAuth(store *Store, codexHome, proxyURL string) error {
 	if err := seedRuntimeAuthIfMissing(store, codexHome, proxyURL); err != nil {
 		return err
 	}
-	if err := sanitizeRuntimeRateLimitState(codexHome); err != nil {
+	if _, err := SanitizeRuntimeRateLimitState(codexHome, false); err != nil {
 		return fmt.Errorf("sanitize runtime rate limits: %w", err)
+	}
+	if strings.TrimSpace(proxyURL) != "" {
+		if status := CheckRuntimeAuth(codexHome); !status.OK {
+			return fmt.Errorf("runtime auth self-check failed: %s", status.Issue)
+		}
 	}
 	return nil
 }
 
-func sanitizeRuntimeRateLimitState(codexHome string) error {
+type RuntimeAuthStatus struct {
+	OK                  bool   `json:"ok"`
+	Path                string `json:"path"`
+	Exists              bool   `json:"exists"`
+	AccountID           string `json:"account_id,omitempty"`
+	AccessSubject       string `json:"access_subject,omitempty"`
+	AccessAccountID     string `json:"access_account_id,omitempty"`
+	AccessEmail         string `json:"access_email,omitempty"`
+	ProfileEmail        string `json:"profile_email,omitempty"`
+	RefreshTokenProxy   bool   `json:"refresh_token_proxy"`
+	AccessEqualsIDToken bool   `json:"access_equals_id_token"`
+	Issue               string `json:"issue,omitempty"`
+}
+
+func CheckRuntimeAuth(codexHome string) RuntimeAuthStatus {
+	path := filepath.Join(codexHome, "auth.json")
+	status := RuntimeAuthStatus{Path: path}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			status.Issue = "missing auth.json"
+			return status
+		}
+		status.Issue = fmt.Sprintf("read auth.json: %v", err)
+		return status
+	}
+	status.Exists = true
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		status.Issue = fmt.Sprintf("parse auth.json: %v", err)
+		return status
+	}
+	tokens, _ := payload["tokens"].(map[string]any)
+	if tokens == nil {
+		status.Issue = "missing tokens object"
+		return status
+	}
+
+	accessToken := strings.TrimSpace(stringField(tokens["access_token"]))
+	idToken := strings.TrimSpace(stringField(tokens["id_token"]))
+	refreshToken := strings.TrimSpace(stringField(tokens["refresh_token"]))
+	status.AccountID = strings.TrimSpace(stringField(tokens["account_id"]))
+	status.RefreshTokenProxy = refreshToken == proxyRuntimeRefreshToken
+	status.AccessEqualsIDToken = accessToken != "" && accessToken == idToken
+
+	claims, err := decodeJWTPayload(accessToken)
+	if err != nil {
+		status.Issue = fmt.Sprintf("decode access token: %v", err)
+		return status
+	}
+	status.AccessSubject = strings.TrimSpace(stringField(claims["sub"]))
+	status.AccessAccountID = nestedString(claims, "https://api.openai.com/auth", "chatgpt_account_id")
+	status.AccessEmail = strings.TrimSpace(stringField(claims["email"]))
+	status.ProfileEmail = nestedString(claims, "https://api.openai.com/profile", "email")
+
+	checks := map[string]bool{
+		"tokens.account_id is proxy-only":    status.AccountID == "proxy-only",
+		"access token account is proxy-only": status.AccessAccountID == "proxy-only",
+		"access token subject is proxy-only": status.AccessSubject == "codexlb-proxy-only",
+		"access token email is proxy-only":   status.AccessEmail == "proxy-only@codexlb.internal",
+		"profile email is proxy-only":        status.ProfileEmail == "proxy-only@codexlb.internal",
+		"refresh token is not proxy token":   status.RefreshTokenProxy,
+		"access and id token match":          status.AccessEqualsIDToken,
+	}
+	for label, ok := range checks {
+		if !ok {
+			status.Issue = label
+			return status
+		}
+	}
+	status.OK = true
+	return status
+}
+
+type RuntimeRateLimitSanitizeResult struct {
+	RolloutFilesScanned int  `json:"rollout_files_scanned"`
+	RolloutFilesChanged int  `json:"rollout_files_changed"`
+	RolloutLinesChanged int  `json:"rollout_lines_changed"`
+	LogArtifactsRotated int  `json:"log_artifacts_rotated"`
+	HistoryFilesChanged int  `json:"history_files_changed"`
+	HistoryLinesChanged int  `json:"history_lines_changed"`
+	Aggressive          bool `json:"aggressive"`
+}
+
+func SanitizeRuntimeRateLimitState(codexHome string, aggressive bool) (RuntimeRateLimitSanitizeResult, error) {
+	result := RuntimeRateLimitSanitizeResult{Aggressive: aggressive}
 	sessionsDir := filepath.Join(codexHome, "sessions")
 	info, err := os.Stat(sessionsDir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+		if !errors.Is(err, os.ErrNotExist) {
+			return result, err
 		}
-		return err
-	}
-	if !info.IsDir() {
-		return nil
+	} else if info.IsDir() {
+		if err := filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !d.Type().IsRegular() || !strings.HasSuffix(strings.ToLower(d.Name()), ".jsonl") {
+				return nil
+			}
+			result.RolloutFilesScanned++
+			changed, lines, err := stripPersistedRateLimitsFromRollout(path)
+			if changed {
+				result.RolloutFilesChanged++
+				result.RolloutLinesChanged += lines
+			}
+			return err
+		}); err != nil {
+			return result, err
+		}
 	}
 
-	return filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
+	historyPath := filepath.Join(codexHome, "history.jsonl")
+	if isRegularFile(historyPath) {
+		changed, lines, err := stripPersistedRateLimitsFromRollout(historyPath)
 		if err != nil {
-			return err
+			return result, err
 		}
-		if d.IsDir() || !d.Type().IsRegular() || !strings.HasSuffix(strings.ToLower(d.Name()), ".jsonl") {
-			return nil
+		if changed {
+			result.HistoryFilesChanged++
+			result.HistoryLinesChanged += lines
 		}
-		return stripPersistedRateLimitsFromRollout(path)
-	})
+	}
+
+	if aggressive {
+		rotated, err := rotateRuntimeRateLimitLogArtifacts(codexHome)
+		if err != nil {
+			return result, err
+		}
+		result.LogArtifactsRotated = rotated
+	}
+	return result, nil
 }
 
-func stripPersistedRateLimitsFromRollout(path string) error {
+func stripPersistedRateLimitsFromRollout(path string) (bool, int, error) {
 	in, err := os.Open(path)
 	if err != nil {
-		return err
+		return false, 0, err
 	}
 	defer in.Close()
 
 	tmpPath := path + ".tmp"
 	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return false, 0, err
 	}
 
 	reader := bufio.NewReader(in)
 	changed := false
+	changedLines := 0
 	writeErr := func(err error) error {
 		_ = out.Close()
 		_ = os.Remove(tmpPath)
@@ -315,33 +437,37 @@ func stripPersistedRateLimitsFromRollout(path string) error {
 		if len(line) > 0 {
 			updated, lineChanged, err := stripRateLimitsFromRolloutLine(line)
 			if err != nil {
-				return writeErr(err)
+				return false, 0, writeErr(err)
 			}
 			if lineChanged {
 				changed = true
+				changedLines++
 				line = updated
 			}
 			if _, err := out.Write(line); err != nil {
-				return writeErr(err)
+				return false, 0, writeErr(err)
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {
-			return writeErr(readErr)
+			return false, 0, writeErr(readErr)
 		}
 	}
 
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return false, 0, err
 	}
 	if !changed {
 		_ = os.Remove(tmpPath)
-		return nil
+		return false, 0, nil
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return false, 0, err
+	}
+	return true, changedLines, nil
 }
 
 func stripRateLimitsFromRolloutLine(line []byte) ([]byte, bool, error) {
@@ -378,6 +504,125 @@ func stripRateLimitsFromRolloutLine(line []byte) ([]byte, bool, error) {
 		updated = append(updated, '\n')
 	}
 	return updated, true, nil
+}
+
+func rotateRuntimeRateLimitLogArtifacts(codexHome string) (int, error) {
+	rotated := 0
+	suffix := ".codexlb-sanitized-" + time.Now().UTC().Format("20060102T150405Z")
+	seenSQLite := map[string]struct{}{}
+
+	if err := filepath.WalkDir(codexHome, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+		name := d.Name()
+		lower := strings.ToLower(name)
+		if strings.Contains(lower, ".codexlb-sanitized-") {
+			return nil
+		}
+
+		if strings.HasSuffix(lower, ".log") {
+			contains, err := fileContainsAny(path, []string{`"rate_limits"`, "rateLimits", "account/rateLimits"})
+			if err != nil {
+				return err
+			}
+			if contains {
+				if err := os.Rename(path, path+suffix); err != nil {
+					return err
+				}
+				rotated++
+			}
+			return nil
+		}
+
+		sqliteBase, ok := runtimeLogSQLiteBase(path)
+		if !ok {
+			return nil
+		}
+		if _, done := seenSQLite[sqliteBase]; done {
+			return nil
+		}
+		seenSQLite[sqliteBase] = struct{}{}
+		if runtimeSQLiteLogSetContainsRateLimit(sqliteBase) {
+			for _, candidate := range []string{sqliteBase, sqliteBase + "-wal", sqliteBase + "-shm"} {
+				if isRegularFile(candidate) {
+					if err := os.Rename(candidate, candidate+suffix); err != nil {
+						return err
+					}
+					rotated++
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return rotated, err
+	}
+
+	return rotated, nil
+}
+
+func runtimeLogSQLiteBase(path string) (string, bool) {
+	base := path
+	switch {
+	case strings.HasSuffix(base, ".sqlite-wal"):
+		base = strings.TrimSuffix(base, "-wal")
+	case strings.HasSuffix(base, ".sqlite-shm"):
+		base = strings.TrimSuffix(base, "-shm")
+	case strings.HasSuffix(base, ".sqlite"):
+	default:
+		return "", false
+	}
+	if !strings.Contains(strings.ToLower(filepath.Base(base)), "log") {
+		return "", false
+	}
+	return base, true
+}
+
+func runtimeSQLiteLogSetContainsRateLimit(base string) bool {
+	for _, candidate := range []string{base, base + "-wal"} {
+		if !isRegularFile(candidate) {
+			continue
+		}
+		contains, err := fileContainsAny(candidate, []string{`"rate_limits"`, "rateLimits", "account/rateLimits"})
+		if err == nil && contains {
+			return true
+		}
+	}
+	return false
+}
+
+func fileContainsAny(path string, needles []string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	chunks := make([]byte, 0, 64*1024)
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			chunks = append(chunks, buf[:n]...)
+			for _, needle := range needles {
+				if bytes.Contains(chunks, []byte(needle)) {
+					return true, nil
+				}
+			}
+			if len(chunks) > 128*1024 {
+				chunks = append([]byte(nil), chunks[len(chunks)-64*1024:]...)
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return false, nil
+		}
+		if readErr != nil {
+			return false, readErr
+		}
+	}
 }
 
 func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
@@ -428,7 +673,7 @@ func seedRuntimeAuthIfMissing(store *Store, codexHome, proxyURL string) error {
 	if err := syncDefaultRuntimeConfig(codexHome, proxyURL); err != nil {
 		return err
 	}
-	if err := writeProxyOnlyRuntimeAuth(targetAuth); err != nil {
+	if err := writeProxyOnlyRuntimeAuth(targetAuth, runtimeRefreshTokenOverride(proxyURL)); err != nil {
 		return fmt.Errorf("write proxy-only runtime auth.json: %w", err)
 	}
 	return nil
@@ -662,8 +907,8 @@ func runtimeAuthCandidateIndexes(snapshot StoreFile, nowMS int64) []int {
 	return candidates
 }
 
-func writeProxyOnlyRuntimeAuth(path string) error {
-	payload, err := proxyOnlyRuntimeAuthPayload(proxyOnlyRuntimeProfile{})
+func writeProxyOnlyRuntimeAuth(path, refreshToken string) error {
+	payload, err := proxyOnlyRuntimeAuthPayloadWithRefreshToken(proxyOnlyRuntimeProfile{}, refreshToken)
 	if err != nil {
 		return err
 	}

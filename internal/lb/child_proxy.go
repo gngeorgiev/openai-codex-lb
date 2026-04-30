@@ -469,6 +469,7 @@ func rewriteForChildProxy(src *url.URL, proxyURL string) (*url.URL, error) {
 
 func (p *ProxyServer) buildStatus(ctx context.Context, snapshot StoreFile, now time.Time, refreshChildProxies bool) ProxyStatus {
 	status := BuildProxyStatus(snapshot, now)
+	status.RuntimeAuth = CheckRuntimeAuth(p.store.RuntimeDir())
 	if !hasChildProxyRouting(snapshot) {
 		return status
 	}

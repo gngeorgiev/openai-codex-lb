@@ -2,6 +2,7 @@ package lb
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -177,6 +178,59 @@ func TestEnsureRuntimeAuthStripsPersistedRuntimeRateLimits(t *testing.T) {
 	}
 	if !strings.Contains(text, `"message":"keep me"`) {
 		t.Fatalf("expected non-token-count events to remain, got %s", text)
+	}
+}
+
+func TestSanitizeRuntimeRateLimitStateAggressiveRotatesLogArtifacts(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	runtimeHome := filepath.Join(root, "runtime")
+	if err := os.MkdirAll(filepath.Join(runtimeHome, "log"), 0o700); err != nil {
+		t.Fatalf("mkdir runtime log dir: %v", err)
+	}
+	textLog := filepath.Join(runtimeHome, "log", "codex-tui.log")
+	if err := os.WriteFile(textLog, []byte(`account/rateLimits/read failed`), 0o600); err != nil {
+		t.Fatalf("write text log: %v", err)
+	}
+	sqliteLog := filepath.Join(runtimeHome, "logs_2.sqlite")
+	if err := os.WriteFile(sqliteLog, []byte(`not really sqlite but contains "rate_limits"`), 0o600); err != nil {
+		t.Fatalf("write sqlite log: %v", err)
+	}
+	if err := os.WriteFile(sqliteLog+"-wal", []byte(`wal`), 0o600); err != nil {
+		t.Fatalf("write sqlite wal: %v", err)
+	}
+
+	result, err := SanitizeRuntimeRateLimitState(runtimeHome, true)
+	if err != nil {
+		t.Fatalf("SanitizeRuntimeRateLimitState: %v", err)
+	}
+	if result.LogArtifactsRotated != 3 {
+		t.Fatalf("LogArtifactsRotated = %d, want 3", result.LogArtifactsRotated)
+	}
+	for _, path := range []string{textLog, sqliteLog, sqliteLog + "-wal"} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected %s to be rotated, stat err=%v", path, err)
+		}
+	}
+}
+
+func TestCheckRuntimeAuthRejectsRealAccountToken(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	runtimeHome := filepath.Join(root, "runtime")
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatalf("mkdir runtime home: %v", err)
+	}
+	writeAuthForTest(t, runtimeHome, "acct-real", "real@example.com")
+
+	status := CheckRuntimeAuth(runtimeHome)
+	if status.OK {
+		t.Fatalf("expected real account runtime auth to fail check: %+v", status)
+	}
+	if status.Issue == "" {
+		t.Fatalf("expected issue for bad runtime auth: %+v", status)
 	}
 }
 

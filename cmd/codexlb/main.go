@@ -44,6 +44,8 @@ func run(argv []string) int {
 		return runLoginWith(argv[1:])
 	case "status":
 		return runStatus(argv[1:])
+	case "doctor":
+		return runDoctor(argv[1:])
 	case "run":
 		return runCodex(argv[1:])
 	case "help", "-h", "--help":
@@ -1139,6 +1141,84 @@ Examples:
 	return 0
 }
 
+func runDoctor(argv []string) int {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	root := fs.String("root", defaultRootFlagValue(), "State directory (default: $CODEXLB_ROOT or ~/.codex-lb)")
+	proxyURL := fs.String("proxy-url", defaultProxyURLFlagValue(), "Proxy URL used when --fix rewrites runtime auth")
+	codexHome := fs.String("codex-home", "", "Runtime CODEX_HOME to check (default: <root>/runtime)")
+	fix := fs.Bool("fix", false, "Rewrite runtime auth and aggressively clear stale rate-limit state before checking")
+	jsonOut := fs.Bool("json", false, "Print JSON result")
+	fs.Usage = func() {
+		fmt.Fprint(fs.Output(), `Usage: codexlb doctor [flags]
+
+Checks that runtime auth is proxy-only and contains no upstream account token.
+
+Flags:
+`)
+		fs.PrintDefaults()
+		fmt.Fprint(fs.Output(), `
+Examples:
+  codexlb doctor
+  codexlb doctor --fix
+  codexlb doctor --json
+`)
+	}
+	if err := fs.Parse(argv); err != nil {
+		return parseFlagError(err)
+	}
+
+	store, err := lb.OpenStore(*root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open store: %v\n", err)
+		return 1
+	}
+	runtimeHome := strings.TrimSpace(*codexHome)
+	if runtimeHome == "" {
+		runtimeHome = store.RuntimeDir()
+	}
+
+	var sanitize lb.RuntimeRateLimitSanitizeResult
+	if *fix {
+		url := resolveProxyURL(store, *proxyURL)
+		if err := lb.EnsureRuntimeAuthAt(store, runtimeHome, url); err != nil {
+			fmt.Fprintf(os.Stderr, "sync runtime auth: %v\n", err)
+			return 1
+		}
+		sanitize, err = lb.SanitizeRuntimeRateLimitState(runtimeHome, true)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sanitize runtime rate limits: %v\n", err)
+			return 1
+		}
+	}
+
+	authStatus := lb.CheckRuntimeAuth(runtimeHome)
+	if *jsonOut {
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"runtime_auth": authStatus,
+			"sanitize":     sanitize,
+		})
+	} else {
+		if authStatus.OK {
+			fmt.Printf("runtime auth: ok (%s)\n", authStatus.Path)
+		} else {
+			fmt.Printf("runtime auth: bad (%s): %s\n", authStatus.Path, authStatus.Issue)
+		}
+		if *fix {
+			fmt.Printf("rate-limit cleanup: rollout_files_changed=%d rollout_lines_changed=%d history_files_changed=%d history_lines_changed=%d log_artifacts_rotated=%d\n",
+				sanitize.RolloutFilesChanged,
+				sanitize.RolloutLinesChanged,
+				sanitize.HistoryFilesChanged,
+				sanitize.HistoryLinesChanged,
+				sanitize.LogArtifactsRotated,
+			)
+		}
+	}
+	if !authStatus.OK {
+		return 1
+	}
+	return 0
+}
+
 func resolveProxyURL(store *lb.Store, proxyURL string) string {
 	url := strings.TrimSpace(proxyURL)
 	if url != "" {
@@ -1918,6 +1998,7 @@ Commands:
   account  Manage enrolled accounts (login/import/list/rm/pin/unpin)
   login-with  Run a Dockerized browser login flow and import the resulting auth into host CODEX_HOME
   status   Show runtime status table from running proxy
+  doctor   Check runtime auth and stale rate-limit state
   run      Run codex with proxy endpoint environment wiring
 
 Run 'codexlb <command> --help' for detailed flags and examples.

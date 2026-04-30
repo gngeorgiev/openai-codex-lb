@@ -103,6 +103,55 @@ func TestProxySelectsAccountByUsage(t *testing.T) {
 	}
 }
 
+func TestProxyRuntimeAuthHealthEndpointAndStatus(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	if err := os.MkdirAll(store.RuntimeDir(), 0o700); err != nil {
+		t.Fatalf("mkdir runtime dir: %v", err)
+	}
+	if err := writeProxyOnlyRuntimeAuth(filepath.Join(store.RuntimeDir(), "auth.json"), proxyRuntimeRefreshToken); err != nil {
+		t.Fatalf("write proxy-only runtime auth: %v", err)
+	}
+
+	proxySrv := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer proxySrv.Close()
+
+	resp, err := http.Get(proxySrv.URL + "/health/auth-runtime")
+	if err != nil {
+		t.Fatalf("GET runtime auth health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected health 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	var health RuntimeAuthStatus
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if !health.OK || health.AccountID != "proxy-only" {
+		t.Fatalf("unexpected runtime auth health: %+v", health)
+	}
+
+	statusResp, err := http.Get(proxySrv.URL + "/status")
+	if err != nil {
+		t.Fatalf("GET status: %v", err)
+	}
+	defer statusResp.Body.Close()
+	var status ProxyStatus
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if !status.RuntimeAuth.OK {
+		t.Fatalf("expected status runtime auth ok: %+v", status.RuntimeAuth)
+	}
+}
+
 func TestProxyRewritesCodexAppsForBackendAccounts(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

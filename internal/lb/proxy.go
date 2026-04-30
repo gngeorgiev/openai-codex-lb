@@ -126,6 +126,22 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if r.URL.Path == "/health/auth-runtime" {
+		status := CheckRuntimeAuth(p.store.RuntimeDir())
+		code := http.StatusOK
+		if !status.OK {
+			code = http.StatusServiceUnavailable
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(status)
+		p.logEvent("request.completed", map[string]any{
+			"req_id": reqID,
+			"status": code,
+			"path":   r.URL.Path,
+		})
+		return
+	}
 
 	if r.URL.Path == "/status" {
 		now := time.Now()

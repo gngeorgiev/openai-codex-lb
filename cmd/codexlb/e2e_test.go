@@ -68,6 +68,46 @@ func TestE2EWrapperLoginAndRun(t *testing.T) {
 	}
 }
 
+func TestDoctorFailsBadRuntimeAuthAndFixesIt(t *testing.T) {
+	root := t.TempDir()
+	runtimeHome := filepath.Join(root, "runtime")
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatalf("mkdir runtime home: %v", err)
+	}
+	realToken := testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-real"},
+		"https://api.openai.com/profile": map[string]any{"email": "real@example.com"},
+	})
+	if err := os.WriteFile(filepath.Join(runtimeHome, "auth.json"), []byte(`{"tokens":{"access_token":"`+realToken+`","id_token":"`+realToken+`","refresh_token":"real-refresh","account_id":"acct-real"}}`), 0o600); err != nil {
+		t.Fatalf("write runtime auth: %v", err)
+	}
+
+	out, code := captureStdout(func() int {
+		return run([]string{"doctor", "--root", root})
+	})
+	if code == 0 {
+		t.Fatalf("expected doctor to fail for real runtime auth, output=%s", out)
+	}
+	if !strings.Contains(out, "runtime auth: bad") {
+		t.Fatalf("expected bad runtime auth output, got %s", out)
+	}
+
+	fixOut, code := captureStdout(func() int {
+		return run([]string{"doctor", "--root", root, "--fix", "--proxy-url", "http://127.0.0.1:9876"})
+	})
+	if code != 0 {
+		t.Fatalf("expected doctor --fix to pass, code=%d output=%s", code, fixOut)
+	}
+	if !strings.Contains(fixOut, "runtime auth: ok") {
+		t.Fatalf("expected fixed runtime auth output, got %s", fixOut)
+	}
+
+	status := lb.CheckRuntimeAuth(runtimeHome)
+	if !status.OK {
+		t.Fatalf("expected proxy-only runtime auth after fix: %+v", status)
+	}
+}
+
 func TestE2EWrapperRunSeedsRuntimeConfigFromUserCodexHome(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "home")

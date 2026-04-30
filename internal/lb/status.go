@@ -11,6 +11,7 @@ type ProxyStatus struct {
 	GeneratedAt       string                  `json:"generated_at"`
 	Policy            PolicyConfig            `json:"policy"`
 	State             RuntimeState            `json:"state"`
+	RuntimeAuth       RuntimeAuthStatus       `json:"runtime_auth"`
 	SelectedAccountID string                  `json:"selected_account_id,omitempty"`
 	SelectedProxyURL  string                  `json:"selected_proxy_url,omitempty"`
 	SelectedProxyName string                  `json:"selected_proxy_name,omitempty"`
