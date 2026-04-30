@@ -219,6 +219,9 @@ func writeJSONAtomic(path string, v any) error {
 func cloneStore(in StoreFile) StoreFile {
 	out := in
 	out.Accounts = append([]Account(nil), in.Accounts...)
+	for i := range out.Accounts {
+		out.Accounts[i].Quota.AdditionalLimits = append([]AdditionalQuotaState(nil), in.Accounts[i].Quota.AdditionalLimits...)
+	}
 	out.Settings.Proxy.ChildProxyURLs = append([]string(nil), in.Settings.Proxy.ChildProxyURLs...)
 	out.Settings.Commands.Login = append([]string(nil), in.Settings.Commands.Login...)
 	out.Settings.Commands.Run = append([]string(nil), in.Settings.Commands.Run...)

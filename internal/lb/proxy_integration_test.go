@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -724,6 +725,168 @@ func TestProxyReturnsAggregatedUsageForProxyOnlyRuntimeAuthAtRootUsagePath(t *te
 	}
 	if got := payload.RateLimit.PrimaryWindow.UsedPercent; got != 25 {
 		t.Fatalf("expected aggregated primary used_percent 25, got %v", got)
+	}
+}
+
+func TestProxyRewritesLiveRateLimitSignalsToPooledUsage(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	store, err := OpenStore(tmp)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	tokenA := testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-a"},
+		"https://api.openai.com/profile": map[string]any{"email": "a@example.com"},
+	})
+	tokenB := testJWT(map[string]any{
+		"https://api.openai.com/auth":    map[string]any{"chatgpt_account_id": "acct-b"},
+		"https://api.openai.com/profile": map[string]any{"email": "b@example.com"},
+	})
+	homeA := filepath.Join(tmp, "acc-a")
+	homeB := filepath.Join(tmp, "acc-b")
+	writeAuthFile(t, homeA, tokenA, "acct-a")
+	writeAuthFile(t, homeB, tokenB, "acct-b")
+
+	now := time.Now()
+	primaryReset := now.Add(4 * time.Hour).Unix()
+	secondaryReset := now.Add(30 * time.Hour).Unix()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/codex/responses":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("x-codex-primary-used-percent", "75")
+			w.Header().Set("x-codex-primary-window-minutes", "300")
+			w.Header().Set("x-codex-primary-reset-at", strconv.FormatInt(primaryReset, 10))
+			w.Header().Set("x-codex-secondary-used-percent", "90")
+			w.Header().Set("x-codex-secondary-window-minutes", "10080")
+			w.Header().Set("x-codex-secondary-reset-at", strconv.FormatInt(secondaryReset, 10))
+			w.Header().Set("x-codex-spark-primary-used-percent", "95")
+			w.Header().Set("x-codex-spark-primary-window-minutes", "300")
+			w.Header().Set("x-codex-spark-primary-reset-at", strconv.FormatInt(primaryReset, 10))
+			w.Header().Set("x-codex-spark-secondary-used-percent", "99")
+			w.Header().Set("x-codex-spark-secondary-window-minutes", "10080")
+			w.Header().Set("x-codex-spark-secondary-reset-at", strconv.FormatInt(secondaryReset, 10))
+			_, _ = io.WriteString(w, "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"primary\":{\"used_percent\":75,\"window_minutes\":300,\"reset_at\":"+strconv.FormatInt(primaryReset, 10)+"},\"secondary\":{\"used_percent\":90,\"window_minutes\":10080,\"reset_at\":"+strconv.FormatInt(secondaryReset, 10)+"}},\"metered_limit_name\":\"codex\"}\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.UpstreamBaseURL = upstream.URL + "/backend-api"
+		sf.Accounts = []Account{
+			{
+				ID:      "a",
+				Alias:   "a",
+				HomeDir: homeA,
+				BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+				Enabled: true,
+				Quota: QuotaState{
+					DailyLimit:    100,
+					DailyUsed:     75,
+					DailyResetAt:  primaryReset,
+					WeeklyLimit:   100,
+					WeeklyUsed:    90,
+					WeeklyResetAt: secondaryReset,
+					LastSyncAt:    now.UnixMilli(),
+					Source:        "manual",
+				},
+			},
+			{
+				ID:      "b",
+				Alias:   "b",
+				HomeDir: homeB,
+				BaseURL: sf.Settings.Proxy.UpstreamBaseURL,
+				Enabled: true,
+				Quota: QuotaState{
+					DailyLimit:    100,
+					DailyUsed:     25,
+					DailyResetAt:  now.Add(2 * time.Hour).Unix(),
+					WeeklyLimit:   100,
+					WeeklyUsed:    10,
+					WeeklyResetAt: now.Add(20 * time.Hour).Unix(),
+					LastSyncAt:    now.UnixMilli(),
+					Source:        "manual",
+				},
+			},
+		}
+		sf.State.ActiveIndex = 0
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	proxySrv := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer proxySrv.Close()
+
+	resp, err := http.Post(proxySrv.URL+"/responses", "application/json", bytes.NewBufferString(`{"input":"hi"}`))
+	if err != nil {
+		t.Fatalf("post to proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	if got, want := resp.Header.Get("x-codex-primary-used-percent"), "50"; got != want {
+		t.Fatalf("x-codex-primary-used-percent = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("x-codex-secondary-used-percent"), "50"; got != want {
+		t.Fatalf("x-codex-secondary-used-percent = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("x-codex-primary-reset-at"), strconv.FormatInt(now.Add(2*time.Hour).Unix(), 10); got != want {
+		t.Fatalf("x-codex-primary-reset-at = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("x-codex-secondary-reset-at"), strconv.FormatInt(now.Add(20*time.Hour).Unix(), 10); got != want {
+		t.Fatalf("x-codex-secondary-reset-at = %q, want %q", got, want)
+	}
+	if got := resp.Header.Get("x-codex-spark-secondary-used-percent"); got != "" {
+		t.Fatalf("x-codex-spark-secondary-used-percent = %q, want empty", got)
+	}
+	if got, want := resp.Header.Get("x-codex-credits-has-credits"), "false"; got != want {
+		t.Fatalf("x-codex-credits-has-credits = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("x-codex-credits-unlimited"), "false"; got != want {
+		t.Fatalf("x-codex-credits-unlimited = %q, want %q", got, want)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	lines := strings.Split(string(body), "\n")
+	var rateLimitPayload map[string]any
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if !strings.Contains(payload, `"codex.rate_limits"`) {
+			continue
+		}
+		if err := json.Unmarshal([]byte(payload), &rateLimitPayload); err != nil {
+			t.Fatalf("unmarshal rate limit payload: %v", err)
+		}
+		break
+	}
+	if rateLimitPayload == nil {
+		t.Fatalf("expected rewritten codex.rate_limits SSE payload in %q", string(body))
+	}
+	rateLimits, _ := rateLimitPayload["rate_limits"].(map[string]any)
+	primary, _ := rateLimits["primary"].(map[string]any)
+	secondary, _ := rateLimits["secondary"].(map[string]any)
+	if got, ok := primary["used_percent"].(float64); !ok || got != 50 {
+		t.Fatalf("primary.used_percent = %#v, want 50", primary["used_percent"])
+	}
+	if got, ok := secondary["used_percent"].(float64); !ok || got != 50 {
+		t.Fatalf("secondary.used_percent = %#v, want 50", secondary["used_percent"])
+	}
+	if got, ok := primary["reset_at"].(float64); !ok || int64(got) != now.Add(2*time.Hour).Unix() {
+		t.Fatalf("primary.reset_at = %#v, want %d", primary["reset_at"], now.Add(2*time.Hour).Unix())
+	}
+	if got, ok := secondary["reset_at"].(float64); !ok || int64(got) != now.Add(20*time.Hour).Unix() {
+		t.Fatalf("secondary.reset_at = %#v, want %d", secondary["reset_at"], now.Add(20*time.Hour).Unix())
 	}
 }
 
@@ -2444,6 +2607,153 @@ func TestProxySelectsLocalAccountOverChildProxyWhenScoreIsHigher(t *testing.T) {
 	}
 	if activeCount != 1 {
 		t.Fatalf("expected exactly one active account, got %+v", status.Accounts)
+	}
+}
+
+func TestProxyRewritesChildProxyLiveRateLimitSignalsToWholePool(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	tokenLocal := testJWT(map[string]any{
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-local"},
+	})
+	homeLocal := filepath.Join(root, "local")
+	writeAuthFile(t, homeLocal, tokenLocal, "acct-local")
+
+	now := time.Now()
+	localDailyReset := now.Add(1 * time.Hour).Unix()
+	localWeeklyReset := now.Add(10 * time.Hour).Unix()
+	childDailyReset := now.Add(2 * time.Hour).Unix()
+	childWeeklyReset := now.Add(40 * time.Hour).Unix()
+
+	child := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/status":
+			_ = json.NewEncoder(w).Encode(ProxyStatus{
+				ProxyName:         "edge-vpn",
+				GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+				SelectedAccountID: "remote",
+				SelectionReason:   "usage-stay",
+				Accounts: []AccountStatus{
+					{
+						ProxyName:     "edge-vpn",
+						Alias:         "remote",
+						ID:            "remote",
+						Active:        true,
+						Healthy:       true,
+						Enabled:       true,
+						DailyLeftPct:  97,
+						DailyResetAt:  childDailyReset,
+						WeeklyLeftPct: 77,
+						WeeklyResetAt: childWeeklyReset,
+						Score:         0.97,
+					},
+				},
+			})
+		case "/responses":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("x-codex-primary-used-percent", "3")
+			w.Header().Set("x-codex-primary-window-minutes", "300")
+			w.Header().Set("x-codex-primary-reset-at", strconv.FormatInt(childDailyReset, 10))
+			w.Header().Set("x-codex-secondary-used-percent", "23")
+			w.Header().Set("x-codex-secondary-window-minutes", "10080")
+			w.Header().Set("x-codex-secondary-reset-at", strconv.FormatInt(childWeeklyReset, 10))
+			_, _ = io.WriteString(w, "data: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"primary\":{\"used_percent\":3,\"window_minutes\":300,\"reset_at\":"+strconv.FormatInt(childDailyReset, 10)+"},\"secondary\":{\"used_percent\":23,\"window_minutes\":10080,\"reset_at\":"+strconv.FormatInt(childWeeklyReset, 10)+"}},\"metered_limit_name\":\"codex\"}\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"source\":\"child\"}\n\n")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer child.Close()
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Settings.Proxy.Name = "edge-main"
+		sf.Settings.Policy.Mode = PolicyUsageBalanced
+		sf.Settings.Proxy.ChildProxyURLs = []string{child.URL}
+		sf.Accounts = []Account{
+			{
+				ID:      "local",
+				Alias:   "local",
+				HomeDir: homeLocal,
+				Enabled: true,
+				Quota: QuotaState{
+					DailyLimit:    100,
+					DailyUsed:     40,
+					DailyResetAt:  localDailyReset,
+					WeeklyLimit:   100,
+					WeeklyUsed:    60,
+					WeeklyResetAt: localWeeklyReset,
+					LastSyncAt:    now.UnixMilli(),
+					Source:        "manual",
+				},
+			},
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	mainProxy := httptest.NewServer(NewProxyServer(store, nil, nil))
+	defer mainProxy.Close()
+
+	resp, err := http.Post(mainProxy.URL+"/responses", "application/json", bytes.NewBufferString(`{"input":"hi"}`))
+	if err != nil {
+		t.Fatalf("post to main proxy: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d body=%s", resp.StatusCode, string(body))
+	}
+	if got, want := resp.Header.Get("x-codex-primary-used-percent"), "22"; got != want {
+		t.Fatalf("x-codex-primary-used-percent = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("x-codex-secondary-used-percent"), "42"; got != want {
+		t.Fatalf("x-codex-secondary-used-percent = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("x-codex-primary-reset-at"), strconv.FormatInt(localDailyReset, 10); got != want {
+		t.Fatalf("x-codex-primary-reset-at = %q, want %q", got, want)
+	}
+	if got, want := resp.Header.Get("x-codex-secondary-reset-at"), strconv.FormatInt(localWeeklyReset, 10); got != want {
+		t.Fatalf("x-codex-secondary-reset-at = %q, want %q", got, want)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	var rateLimitPayload map[string]any
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") || !strings.Contains(line, `"codex.rate_limits"`) {
+			continue
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &rateLimitPayload); err != nil {
+			t.Fatalf("unmarshal rate limit payload: %v", err)
+		}
+		break
+	}
+	if rateLimitPayload == nil {
+		t.Fatalf("expected codex.rate_limits payload in body=%q", string(body))
+	}
+	rateLimits, _ := rateLimitPayload["rate_limits"].(map[string]any)
+	primary, _ := rateLimits["primary"].(map[string]any)
+	secondary, _ := rateLimits["secondary"].(map[string]any)
+	if got, ok := primary["used_percent"].(float64); !ok || got != 22 {
+		t.Fatalf("primary.used_percent = %#v, want 22", primary["used_percent"])
+	}
+	if got, ok := secondary["used_percent"].(float64); !ok || got != 42 {
+		t.Fatalf("secondary.used_percent = %#v, want 42", secondary["used_percent"])
+	}
+	if got, ok := primary["reset_at"].(float64); !ok || int64(got) != localDailyReset {
+		t.Fatalf("primary.reset_at = %#v, want %d", primary["reset_at"], localDailyReset)
+	}
+	if got, ok := secondary["reset_at"].(float64); !ok || int64(got) != localWeeklyReset {
+		t.Fatalf("secondary.reset_at = %#v, want %d", secondary["reset_at"], localWeeklyReset)
 	}
 }
 

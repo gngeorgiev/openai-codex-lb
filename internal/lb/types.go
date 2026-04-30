@@ -59,15 +59,29 @@ type Settings struct {
 }
 
 type QuotaState struct {
-	DailyLimit             float64 `json:"daily_limit"`
-	DailyUsed              float64 `json:"daily_used"`
-	DailyResetAt           int64   `json:"daily_reset_at"`
-	WeeklyLimit            float64 `json:"weekly_limit"`
-	WeeklyUsed             float64 `json:"weekly_used"`
-	WeeklyResetAt          int64   `json:"weekly_reset_at"`
-	LastSyncAt             int64   `json:"last_sync_at"`
-	LastSyncMessageCounter int64   `json:"last_sync_message_counter"`
-	Source                 string  `json:"source"`
+	DailyLimit             float64                `json:"daily_limit"`
+	DailyUsed              float64                `json:"daily_used"`
+	DailyResetAt           int64                  `json:"daily_reset_at"`
+	WeeklyLimit            float64                `json:"weekly_limit"`
+	WeeklyUsed             float64                `json:"weekly_used"`
+	WeeklyResetAt          int64                  `json:"weekly_reset_at"`
+	AdditionalLimits       []AdditionalQuotaState `json:"additional_limits,omitempty"`
+	LastSyncAt             int64                  `json:"last_sync_at"`
+	LastSyncMessageCounter int64                  `json:"last_sync_message_counter"`
+	Source                 string                 `json:"source"`
+}
+
+type AdditionalQuotaState struct {
+	LimitID                string  `json:"limit_id"`
+	LimitName              string  `json:"limit_name,omitempty"`
+	PrimaryLimit           float64 `json:"primary_limit"`
+	PrimaryUsed            float64 `json:"primary_used"`
+	PrimaryResetAt         int64   `json:"primary_reset_at"`
+	PrimaryWindowSeconds   int64   `json:"primary_window_seconds"`
+	SecondaryLimit         float64 `json:"secondary_limit"`
+	SecondaryUsed          float64 `json:"secondary_used"`
+	SecondaryResetAt       int64   `json:"secondary_reset_at"`
+	SecondaryWindowSeconds int64   `json:"secondary_window_seconds"`
 }
 
 type Account struct {

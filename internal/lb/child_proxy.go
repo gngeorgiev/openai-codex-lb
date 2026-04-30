@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -738,6 +739,13 @@ func (p *ProxyServer) handleHTTPViaChildProxies(w http.ResponseWriter, r *http.R
 			"child_proxy_url": child.URL,
 			"attempt":         attempt,
 		})
+		pooledStatus := p.buildStatus(context.WithoutCancel(r.Context()), p.store.Snapshot(), now, false)
+		if err := maybeRewritePooledRateLimits(r.URL.Path, resp, aggregateUsageResponse(pooledStatus, now)); err != nil {
+			resp.Body = io.NopCloser(strings.NewReader(`{"error":"invalid rate limit response"}`))
+			resp.StatusCode = http.StatusBadGateway
+			resp.Header = make(http.Header)
+			resp.Header.Set("Content-Type", "application/json")
+		}
 		writeResponse(w, r.URL.Path, resp)
 		return
 	}
@@ -846,6 +854,13 @@ func (p *ProxyServer) handleHTTPViaSelectedChildRoute(w http.ResponseWriter, r *
 		"child_proxy_url": child.URL,
 		"attempt":         attempt,
 	})
+	pooledStatus := p.buildStatus(context.WithoutCancel(r.Context()), p.store.Snapshot(), now, false)
+	if err := maybeRewritePooledRateLimits(r.URL.Path, resp, aggregateUsageResponse(pooledStatus, now)); err != nil {
+		resp.Body = io.NopCloser(strings.NewReader(`{"error":"invalid rate limit response"}`))
+		resp.StatusCode = http.StatusBadGateway
+		resp.Header = make(http.Header)
+		resp.Header.Set("Content-Type", "application/json")
+	}
 	writeResponse(w, r.URL.Path, resp)
 	return true
 }

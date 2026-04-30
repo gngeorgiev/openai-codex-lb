@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -1032,6 +1033,13 @@ func (p *ProxyServer) handleHTTPViaPickedAccount(w http.ResponseWriter, r *http.
 			"attempt":    attempt,
 		})
 	}
+	pooledStatus := p.buildStatus(context.WithoutCancel(r.Context()), p.store.Snapshot(), now, false)
+	if err := maybeRewritePooledRateLimits(r.URL.Path, resp, aggregateUsageResponse(pooledStatus, now)); err != nil {
+		resp.Body = io.NopCloser(strings.NewReader(`{"error":"invalid rate limit response"}`))
+		resp.StatusCode = http.StatusBadGateway
+		resp.Header = make(http.Header)
+		resp.Header.Set("Content-Type", "application/json")
+	}
 	writeResponse(w, r.URL.Path, resp)
 	return true
 }
@@ -1661,6 +1669,181 @@ func writeResponse(w http.ResponseWriter, requestPath string, resp *http.Respons
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func maybeRewritePooledRateLimits(requestPath string, resp *http.Response, pooled usageResponse) error {
+	if !isAccountScopedPath(requestPath) || resp == nil {
+		return nil
+	}
+	rewritePooledRateLimitHeaders(resp.Header, pooled)
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return nil
+	}
+	resp.Body = rewriteRateLimitEventStream(resp.Body, pooled)
+	resp.ContentLength = -1
+	resp.Header.Del("Content-Length")
+	return nil
+}
+
+func rewritePooledRateLimitHeaders(headers http.Header, pooled usageResponse) {
+	if headers == nil {
+		return
+	}
+	clearUpstreamRateLimitHeaders(headers)
+	setRateLimitWindowHeaders(headers, "x-codex-primary", pooled.RateLimit.PrimaryWindow)
+	setRateLimitWindowHeaders(headers, "x-codex-secondary", pooled.RateLimit.SecondaryWindow)
+	setRateLimitCreditsHeaders(headers, pooled.Credits)
+	headers.Set("x-codex-active-limit", "codex")
+	for _, limit := range pooled.AdditionalRateLimits {
+		prefix := rateLimitHeaderPrefix(limit.MeteredFeature)
+		setRateLimitWindowHeaders(headers, prefix+"-primary", limit.RateLimit.PrimaryWindow)
+		setRateLimitWindowHeaders(headers, prefix+"-secondary", limit.RateLimit.SecondaryWindow)
+		if name := strings.TrimSpace(limit.LimitName); name != "" {
+			headers.Set(prefix+"-limit-name", name)
+		}
+	}
+}
+
+func clearUpstreamRateLimitHeaders(headers http.Header) {
+	for name := range headers {
+		lower := strings.ToLower(name)
+		if strings.HasPrefix(lower, "x-codex-credits-") ||
+			strings.HasSuffix(lower, "-primary-used-percent") ||
+			strings.HasSuffix(lower, "-primary-window-minutes") ||
+			strings.HasSuffix(lower, "-primary-reset-at") ||
+			strings.HasSuffix(lower, "-secondary-used-percent") ||
+			strings.HasSuffix(lower, "-secondary-window-minutes") ||
+			strings.HasSuffix(lower, "-secondary-reset-at") ||
+			strings.HasSuffix(lower, "-limit-name") ||
+			lower == "x-codex-active-limit" ||
+			lower == "x-codex-promo-message" {
+			headers.Del(name)
+		}
+	}
+}
+
+func setRateLimitWindowHeaders(headers http.Header, prefix string, window usageWindow) {
+	headers.Set(prefix+"-used-percent", formatUsagePercent(window.UsedPercent))
+	if windowMinutes := window.LimitWindowSeconds / 60; windowMinutes > 0 {
+		headers.Set(prefix+"-window-minutes", strconv.FormatInt(windowMinutes, 10))
+	} else {
+		headers.Del(prefix + "-window-minutes")
+	}
+	resetAt := window.ResetsAt
+	if resetAt <= 0 {
+		resetAt = window.ResetAt
+	}
+	if resetAt > 0 {
+		headers.Set(prefix+"-reset-at", strconv.FormatInt(resetAt, 10))
+	} else {
+		headers.Del(prefix + "-reset-at")
+	}
+}
+
+func setRateLimitCreditsHeaders(headers http.Header, credits usageCredits) {
+	headers.Set("x-codex-credits-has-credits", strconv.FormatBool(credits.HasCredits))
+	headers.Set("x-codex-credits-unlimited", strconv.FormatBool(credits.Unlimited))
+	if strings.TrimSpace(credits.Balance) == "" {
+		headers.Del("x-codex-credits-balance")
+		return
+	}
+	headers.Set("x-codex-credits-balance", credits.Balance)
+}
+
+func rateLimitHeaderPrefix(limitID string) string {
+	normalized := strings.TrimSpace(limitID)
+	if normalized == "" {
+		normalized = "codex"
+	}
+	return "x-" + strings.ReplaceAll(strings.ToLower(normalized), "_", "-")
+}
+
+func formatUsagePercent(v float64) string {
+	if rounded := math.Round(v); math.Abs(v-rounded) < 0.000001 {
+		return strconv.FormatInt(int64(rounded), 10)
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+func rewriteRateLimitEventStream(body io.ReadCloser, pooled usageResponse) io.ReadCloser {
+	if body == nil {
+		return body
+	}
+	reader, writer := io.Pipe()
+	go func() {
+		defer body.Close()
+		defer writer.Close()
+
+		buffered := bufio.NewReader(body)
+		for {
+			line, err := buffered.ReadBytes('\n')
+			if len(line) > 0 {
+				line = rewriteRateLimitEventLine(line, pooled)
+				if _, writeErr := writer.Write(line); writeErr != nil {
+					_ = writer.CloseWithError(writeErr)
+					return
+				}
+			}
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if err != nil {
+				_ = writer.CloseWithError(err)
+				return
+			}
+		}
+	}()
+	return reader
+}
+
+func rewriteRateLimitEventLine(line []byte, pooled usageResponse) []byte {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "data:") {
+		return line
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || !strings.Contains(payload, `"type"`) || !strings.Contains(payload, `codex.rate_limits`) {
+		return line
+	}
+	replacement, ok := pooledRateLimitEventPayload(payload, pooled)
+	if !ok {
+		return line
+	}
+	if bytes.HasSuffix(line, []byte("\n")) {
+		replacement = append(replacement, '\n')
+	}
+	return replacement
+}
+
+func pooledRateLimitEventPayload(payload string, pooled usageResponse) ([]byte, bool) {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+		return nil, false
+	}
+	if stringField(parsed["type"]) != "codex.rate_limits" {
+		return nil, false
+	}
+
+	parsed["plan_type"] = pooled.PlanType
+	parsed["metered_limit_name"] = "codex"
+	parsed["limit_name"] = "codex"
+	parsed["rate_limits"] = map[string]any{
+		"primary": map[string]any{
+			"used_percent":   pooled.RateLimit.PrimaryWindow.UsedPercent,
+			"window_minutes": pooled.RateLimit.PrimaryWindow.LimitWindowSeconds / 60,
+			"reset_at":       pooled.RateLimit.PrimaryWindow.ResetsAt,
+		},
+		"secondary": map[string]any{
+			"used_percent":   pooled.RateLimit.SecondaryWindow.UsedPercent,
+			"window_minutes": pooled.RateLimit.SecondaryWindow.LimitWindowSeconds / 60,
+			"reset_at":       pooled.RateLimit.SecondaryWindow.ResetsAt,
+		},
+	}
+	updated, err := json.Marshal(parsed)
+	if err != nil {
+		return nil, false
+	}
+	return []byte("data: " + string(updated)), true
 }
 
 func cloneHeaders(src http.Header) http.Header {

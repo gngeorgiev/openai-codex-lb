@@ -120,6 +120,11 @@ func accountQuotaExhausted(account Account) bool {
 	if account.Quota.WeeklyLimit > 0 && account.Quota.WeeklyUsed >= account.Quota.WeeklyLimit {
 		return true
 	}
+	for _, limit := range account.Quota.AdditionalLimits {
+		if additionalQuotaExhausted(limit) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -141,7 +146,36 @@ func score(account Account, policy PolicyConfig) float64 {
 	if total <= 0 {
 		return 0
 	}
-	return (dailyWeight/total)*daily + (weeklyWeight/total)*weekly
+	score := (dailyWeight/total)*daily + (weeklyWeight/total)*weekly
+	for _, limit := range account.Quota.AdditionalLimits {
+		score = math.Min(score, additionalQuotaRemaining(limit))
+	}
+	return score
+}
+
+func additionalQuotaExhausted(limit AdditionalQuotaState) bool {
+	return quotaWindowExhausted(limit.PrimaryLimit, limit.PrimaryUsed) || quotaWindowExhausted(limit.SecondaryLimit, limit.SecondaryUsed)
+}
+
+func quotaWindowExhausted(limit, used float64) bool {
+	return limit > 0 && used >= limit
+}
+
+func additionalQuotaRemaining(limit AdditionalQuotaState) float64 {
+	remaining := 1.0
+	hasWindow := false
+	if limit.PrimaryLimit > 0 {
+		remaining = math.Min(remaining, clamp01((limit.PrimaryLimit-limit.PrimaryUsed)/limit.PrimaryLimit))
+		hasWindow = true
+	}
+	if limit.SecondaryLimit > 0 {
+		remaining = math.Min(remaining, clamp01((limit.SecondaryLimit-limit.SecondaryUsed)/limit.SecondaryLimit))
+		hasWindow = true
+	}
+	if !hasWindow {
+		return 1
+	}
+	return remaining
 }
 
 func clamp01(v float64) float64 {

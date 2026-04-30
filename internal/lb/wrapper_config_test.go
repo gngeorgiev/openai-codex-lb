@@ -726,6 +726,132 @@ func TestSeedRuntimeAuthIfMissingSetsProxyChatGPTBaseURLWithoutSourceConfig(t *t
 	}
 }
 
+func TestSeedRuntimeAuthIfMissingPreservesRuntimePromptSelections(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("CODEX_HOME", "")
+
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+
+	accountHome := filepath.Join(root, "acc-a")
+	if err := os.MkdirAll(accountHome, 0o700); err != nil {
+		t.Fatalf("mkdir account home: %v", err)
+	}
+	writeAuthForTest(t, accountHome, "acct-a", "a@example.com")
+	sourceConfig := strings.Join([]string{
+		`model = "gpt-5.4"`,
+		`model_reasoning_effort = "medium"`,
+		`[tui]`,
+		`status_line = ["model"]`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(accountHome, "config.toml"), []byte(sourceConfig), 0o600); err != nil {
+		t.Fatalf("write account config.toml: %v", err)
+	}
+
+	if err := store.Update(func(sf *StoreFile) error {
+		sf.Accounts = []Account{
+			{Alias: "a", ID: "openai:a", HomeDir: accountHome, Enabled: true},
+		}
+		sf.State.ActiveIndex = 0
+		return nil
+	}); err != nil {
+		t.Fatalf("store update: %v", err)
+	}
+
+	runtimeHome := filepath.Join(root, "runtime-persisted-selections")
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatalf("mkdir runtime home: %v", err)
+	}
+	existingRuntimeConfig := strings.Join([]string{
+		`model = "gpt-5.5"`,
+		`model_reasoning_effort = "high"`,
+		`check_for_update_on_startup = false`,
+		`[notice]`,
+		`hide_gpt5_1_migration_prompt = true`,
+		`[notice.model_migrations]`,
+		`"gpt-5.4" = "gpt-5.5"`,
+		`[projects."/workspace/demo"]`,
+		`trust_level = "trusted"`,
+		`[tui]`,
+		`status_line = ["model-with-reasoning"]`,
+		`[tui.model_availability_nux]`,
+		`"gpt-5.5" = 1`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(runtimeHome, "config.toml"), []byte(existingRuntimeConfig), 0o600); err != nil {
+		t.Fatalf("write existing runtime config.toml: %v", err)
+	}
+
+	if err := seedRuntimeAuthIfMissing(store, runtimeHome, "http://codexlb.internal"); err != nil {
+		t.Fatalf("seedRuntimeAuthIfMissing: %v", err)
+	}
+
+	gotConfig, err := os.ReadFile(filepath.Join(runtimeHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read runtime config.toml: %v", err)
+	}
+	cfg := parseRuntimeConfigTOML(t, gotConfig)
+	if got := stringConfigValue(t, cfg, "model"); got != "gpt-5.5" {
+		t.Fatalf("runtime model = %q, want %q", got, "gpt-5.5")
+	}
+	if got := stringConfigValue(t, cfg, "model_reasoning_effort"); got != "high" {
+		t.Fatalf("runtime model_reasoning_effort = %q, want %q", got, "high")
+	}
+	if got, ok := cfg["check_for_update_on_startup"].(bool); !ok || got {
+		t.Fatalf("runtime check_for_update_on_startup = %#v, want false", cfg["check_for_update_on_startup"])
+	}
+	if got := stringConfigValue(t, cfg, "chatgpt_base_url"); got != "http://codexlb.internal" {
+		t.Fatalf("runtime chatgpt_base_url = %q, want %q", got, "http://codexlb.internal")
+	}
+
+	notice, _ := cfg["notice"].(map[string]any)
+	if notice == nil {
+		t.Fatalf("expected runtime notice table")
+	}
+	if got, ok := notice["hide_gpt5_1_migration_prompt"].(bool); !ok || !got {
+		t.Fatalf("runtime notice.hide_gpt5_1_migration_prompt = %#v, want true", notice["hide_gpt5_1_migration_prompt"])
+	}
+	modelMigrations, _ := notice["model_migrations"].(map[string]any)
+	if modelMigrations == nil {
+		t.Fatalf("expected runtime notice.model_migrations table")
+	}
+	if got, ok := modelMigrations["gpt-5.4"].(string); !ok || got != "gpt-5.5" {
+		t.Fatalf("runtime notice.model_migrations[gpt-5.4] = %#v, want gpt-5.5", modelMigrations["gpt-5.4"])
+	}
+
+	projects, _ := cfg["projects"].(map[string]any)
+	if projects == nil {
+		t.Fatalf("expected runtime projects table")
+	}
+	project, _ := projects["/workspace/demo"].(map[string]any)
+	if project == nil {
+		t.Fatalf("expected runtime trusted project entry")
+	}
+	if got, ok := project["trust_level"].(string); !ok || got != "trusted" {
+		t.Fatalf("runtime project trust_level = %#v, want trusted", project["trust_level"])
+	}
+
+	tui, _ := cfg["tui"].(map[string]any)
+	if tui == nil {
+		t.Fatalf("expected runtime tui table")
+	}
+	statusLine, _ := tui["status_line"].([]any)
+	if len(statusLine) != 1 || statusLine[0] != "model" {
+		t.Fatalf("runtime tui.status_line = %#v, want source value", tui["status_line"])
+	}
+	modelAvailability, _ := tui["model_availability_nux"].(map[string]any)
+	if modelAvailability == nil {
+		t.Fatalf("expected runtime tui.model_availability_nux table")
+	}
+	if got, ok := modelAvailability["gpt-5.5"].(int64); !ok || got != 1 {
+		t.Fatalf("runtime tui.model_availability_nux[gpt-5.5] = %#v, want 1", modelAvailability["gpt-5.5"])
+	}
+}
+
 func writeAuthForTest(t *testing.T, home, accountID, email string) {
 	t.Helper()
 	token := testJWT(map[string]any{

@@ -1360,6 +1360,29 @@ func printStatusTable(status lb.ProxyStatus) {
 	}
 	avgRow = append(avgRow, formatAggregatePercent(dailyTotal, dailyCount), "", formatAggregatePercent(weeklyTotal, weeklyCount), "", "")
 	printTabRow(w, avgRow...)
+	for _, limit := range status.AdditionalLimits {
+		label := limit.LimitName
+		if strings.TrimSpace(label) == "" {
+			label = limit.LimitID
+		}
+		label = label + " limit"
+		row := []any{""}
+		if showPin {
+			row = append(row, "")
+		}
+		row = append(row, "", label, "")
+		if showStatus {
+			row = append(row, "")
+		}
+		row = append(row,
+			formatStatusPercent(limit.PrimaryLeftPct),
+			formatStatusResetAt(limit.PrimaryResetAt),
+			formatStatusPercent(limit.SecondaryLeftPct),
+			formatStatusResetAt(limit.SecondaryResetAt),
+			"",
+		)
+		printTabRow(w, row...)
+	}
 	_ = w.Flush()
 
 	if len(status.ChildProxies) == 0 {
@@ -1439,6 +1462,19 @@ func printStatusTableCompact(status lb.ProxyStatus) {
 	fmt.Println()
 	fmt.Println("----")
 	fmt.Printf("daily %s  weekly %s\n", formatAggregatePercent(dailyTotal, dailyCount), formatAggregatePercent(weeklyTotal, weeklyCount))
+	for _, limit := range status.AdditionalLimits {
+		label := limit.LimitName
+		if strings.TrimSpace(label) == "" {
+			label = limit.LimitID
+		}
+		fmt.Printf("%s limit %s (%s)  %s (%s)\n",
+			label,
+			formatStatusPercent(limit.PrimaryLeftPct),
+			formatStatusResetAt(limit.PrimaryResetAt),
+			formatStatusPercent(limit.SecondaryLeftPct),
+			formatStatusResetAt(limit.SecondaryResetAt),
+		)
+	}
 
 	if len(status.ChildProxies) == 0 {
 		return

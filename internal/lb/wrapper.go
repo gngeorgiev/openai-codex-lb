@@ -471,23 +471,32 @@ func copyRuntimeConfigFile(sourceConfig, codexHome, sourceDesc, proxyURL string)
 }
 
 func writeRuntimeConfigBytes(source []byte, codexHome, sourceDesc, proxyURL string) error {
-	normalized, err := normalizeRuntimeConfigData(source, proxyURL)
+	targetConfig := filepath.Join(codexHome, "config.toml")
+	var existing []byte
+	if isRegularFile(targetConfig) {
+		data, err := os.ReadFile(targetConfig)
+		if err != nil {
+			return fmt.Errorf("seed runtime config.toml from %s: read existing runtime config: %w", sourceDesc, err)
+		}
+		existing = data
+	}
+
+	normalized, err := normalizeRuntimeConfigData(source, existing, proxyURL)
 	if err != nil {
 		return fmt.Errorf("seed runtime config.toml from %s: %w", sourceDesc, err)
 	}
 	if len(normalized) == 0 {
 		return nil
 	}
-	targetConfig := filepath.Join(codexHome, "config.toml")
 	if err := os.WriteFile(targetConfig, normalized, 0o600); err != nil {
 		return fmt.Errorf("seed runtime config.toml from %s: %w", sourceDesc, err)
 	}
 	return nil
 }
 
-func normalizeRuntimeConfigData(source []byte, proxyURL string) ([]byte, error) {
+func normalizeRuntimeConfigData(source, existing []byte, proxyURL string) ([]byte, error) {
 	trimmedProxyURL := strings.TrimRight(strings.TrimSpace(proxyURL), "/")
-	if len(source) == 0 && trimmedProxyURL == "" {
+	if len(source) == 0 && len(existing) == 0 && trimmedProxyURL == "" {
 		return nil, nil
 	}
 
@@ -497,10 +506,65 @@ func normalizeRuntimeConfigData(source []byte, proxyURL string) ([]byte, error) 
 			return nil, err
 		}
 	}
+	if len(existing) > 0 {
+		existingCfg := map[string]any{}
+		if err := toml.Unmarshal(existing, &existingCfg); err != nil {
+			return nil, err
+		}
+		preserveRuntimeConfigSelections(cfg, existingCfg)
+	}
 	if trimmedProxyURL != "" {
 		cfg["chatgpt_base_url"] = trimmedProxyURL
 	}
 	return toml.Marshal(cfg)
+}
+
+func preserveRuntimeConfigSelections(cfg, existing map[string]any) {
+	for _, key := range []string{"model", "model_reasoning_effort", "check_for_update_on_startup"} {
+		if value, ok := existing[key]; ok {
+			cfg[key] = cloneConfigValue(value)
+		}
+	}
+	for _, key := range []string{"notice", "projects"} {
+		if value, ok := existing[key]; ok {
+			cfg[key] = cloneConfigValue(value)
+		}
+	}
+
+	existingTUI, _ := existing["tui"].(map[string]any)
+	if existingTUI == nil {
+		return
+	}
+	modelAvailability, ok := existingTUI["model_availability_nux"]
+	if !ok {
+		return
+	}
+
+	targetTUI, _ := cfg["tui"].(map[string]any)
+	if targetTUI == nil {
+		targetTUI = map[string]any{}
+		cfg["tui"] = targetTUI
+	}
+	targetTUI["model_availability_nux"] = cloneConfigValue(modelAvailability)
+}
+
+func cloneConfigValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		cloned := make(map[string]any, len(typed))
+		for key, inner := range typed {
+			cloned[key] = cloneConfigValue(inner)
+		}
+		return cloned
+	case []any:
+		cloned := make([]any, len(typed))
+		for i, inner := range typed {
+			cloned[i] = cloneConfigValue(inner)
+		}
+		return cloned
+	default:
+		return typed
+	}
 }
 
 func defaultCodexConfigPath(codexHome string) string {

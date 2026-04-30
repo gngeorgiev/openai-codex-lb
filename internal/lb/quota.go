@@ -30,6 +30,12 @@ type usageRateLimit struct {
 	SecondaryWindow usageWindow `json:"secondary_window"`
 }
 
+type usageAdditionalRateLimit struct {
+	LimitName      string         `json:"limit_name"`
+	MeteredFeature string         `json:"metered_feature"`
+	RateLimit      usageRateLimit `json:"rate_limit"`
+}
+
 type usageCredits struct {
 	HasCredits          bool   `json:"has_credits"`
 	Unlimited           bool   `json:"unlimited"`
@@ -44,17 +50,17 @@ type usageSpendControl struct {
 }
 
 type usageResponse struct {
-	UserID               string            `json:"user_id,omitempty"`
-	AccountID            string            `json:"account_id,omitempty"`
-	Email                string            `json:"email,omitempty"`
-	PlanType             string            `json:"plan_type,omitempty"`
-	RateLimit            usageRateLimit    `json:"rate_limit"`
-	CodeReviewRateLimit  any               `json:"code_review_rate_limit"`
-	AdditionalRateLimits []any             `json:"additional_rate_limits"`
-	Credits              usageCredits      `json:"credits"`
-	SpendControl         usageSpendControl `json:"spend_control"`
-	RateLimitReachedType any               `json:"rate_limit_reached_type"`
-	Promo                any               `json:"promo"`
+	UserID               string                     `json:"user_id,omitempty"`
+	AccountID            string                     `json:"account_id,omitempty"`
+	Email                string                     `json:"email,omitempty"`
+	PlanType             string                     `json:"plan_type,omitempty"`
+	RateLimit            usageRateLimit             `json:"rate_limit"`
+	CodeReviewRateLimit  any                        `json:"code_review_rate_limit"`
+	AdditionalRateLimits []usageAdditionalRateLimit `json:"additional_rate_limits"`
+	Credits              usageCredits               `json:"credits"`
+	SpendControl         usageSpendControl          `json:"spend_control"`
+	RateLimitReachedType any                        `json:"rate_limit_reached_type"`
+	Promo                any                        `json:"promo"`
 }
 
 type upstreamStatusError struct {
@@ -129,6 +135,7 @@ func refreshQuotaForAccount(ctx context.Context, client *http.Client, account *A
 	account.Quota.WeeklyLimit = weeklyLimit
 	account.Quota.WeeklyUsed = weeklyUsed
 	account.Quota.WeeklyResetAt = weeklyReset
+	account.Quota.AdditionalLimits = mapAdditionalQuotaStates(now, payload.AdditionalRateLimits)
 	account.Quota.LastSyncAt = now.UnixMilli()
 	account.Quota.Source = "openai_usage_api"
 	return nil
@@ -148,7 +155,10 @@ func dueForQuotaRefresh(account Account, state RuntimeState, quotaCfg QuotaConfi
 	if msgsSince >= refreshMessages {
 		return true
 	}
-	return account.Quota.DailyLimit <= 0 || account.Quota.WeeklyLimit <= 0
+	if account.Quota.DailyLimit <= 0 || account.Quota.WeeklyLimit <= 0 {
+		return true
+	}
+	return len(account.Quota.AdditionalLimits) > 0 && additionalLimitsMissingWindowData(account.Quota.AdditionalLimits)
 }
 
 func parseRetryAfterSeconds(headers http.Header) int {
@@ -210,8 +220,86 @@ func aggregateUsageResponse(status ProxyStatus, now time.Time) usageResponse {
 	if weeklyResetAt > 0 {
 		payload.RateLimit.SecondaryWindow.ResetAfterSeconds = maxInt64(0, weeklyResetAt-now.Unix())
 	}
+	payload.AdditionalRateLimits = aggregateAdditionalUsageLimits(status.AdditionalLimits, now)
 
 	return payload
+}
+
+func mapAdditionalQuotaStates(now time.Time, additional []usageAdditionalRateLimit) []AdditionalQuotaState {
+	if len(additional) == 0 {
+		return nil
+	}
+	out := make([]AdditionalQuotaState, 0, len(additional))
+	for _, limit := range additional {
+		primaryLimit, primaryUsed, primaryReset := parseWindow(now, limit.RateLimit.PrimaryWindow)
+		secondaryLimit, secondaryUsed, secondaryReset := parseWindow(now, limit.RateLimit.SecondaryWindow)
+		out = append(out, AdditionalQuotaState{
+			LimitID:                strings.TrimSpace(limit.MeteredFeature),
+			LimitName:              strings.TrimSpace(limit.LimitName),
+			PrimaryLimit:           primaryLimit,
+			PrimaryUsed:            primaryUsed,
+			PrimaryResetAt:         primaryReset,
+			PrimaryWindowSeconds:   limit.RateLimit.PrimaryWindow.LimitWindowSeconds,
+			SecondaryLimit:         secondaryLimit,
+			SecondaryUsed:          secondaryUsed,
+			SecondaryResetAt:       secondaryReset,
+			SecondaryWindowSeconds: limit.RateLimit.SecondaryWindow.LimitWindowSeconds,
+		})
+	}
+	return out
+}
+
+func additionalLimitsMissingWindowData(limits []AdditionalQuotaState) bool {
+	for _, limit := range limits {
+		if limit.PrimaryLimit <= 0 && limit.SecondaryLimit <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func aggregateAdditionalUsageLimits(limits []AdditionalLimitStatus, now time.Time) []usageAdditionalRateLimit {
+	if len(limits) == 0 {
+		return nil
+	}
+	out := make([]usageAdditionalRateLimit, 0, len(limits))
+	for _, limit := range limits {
+		entry := usageAdditionalRateLimit{
+			LimitName:      firstNonEmpty(strings.TrimSpace(limit.LimitName), strings.TrimSpace(limit.LimitID)),
+			MeteredFeature: strings.TrimSpace(limit.LimitID),
+		}
+		entry.RateLimit = usageRateLimit{
+			Allowed:      true,
+			LimitReached: false,
+		}
+		entry.RateLimit.PrimaryWindow = usageWindowFromStatus(limit.PrimaryLeftPct, limit.PrimaryResetAt, limit.PrimaryWindowSeconds, now)
+		entry.RateLimit.SecondaryWindow = usageWindowFromStatus(limit.SecondaryLeftPct, limit.SecondaryResetAt, limit.SecondaryWindowSeconds, now)
+		if entry.RateLimit.PrimaryWindow.UsedPercent >= 100 || entry.RateLimit.SecondaryWindow.UsedPercent >= 100 {
+			entry.RateLimit.Allowed = false
+			entry.RateLimit.LimitReached = true
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func usageWindowFromStatus(leftPct float64, resetAt, windowSeconds int64, now time.Time) usageWindow {
+	if leftPct < 0 {
+		return usageWindow{}
+	}
+	usedPct := normalizeUsagePercentForBackend(clampUsagePercent(100 - leftPct))
+	w := usageWindow{
+		Limit:              100,
+		Used:               usedPct,
+		UsedPercent:        usedPct,
+		LimitWindowSeconds: windowSeconds,
+		ResetAt:            resetAt,
+		ResetsAt:           resetAt,
+	}
+	if resetAt > 0 {
+		w.ResetAfterSeconds = maxInt64(0, resetAt-now.Unix())
+	}
+	return w
 }
 
 func aggregateUsageWindow(accounts []AccountStatus, now time.Time, extract func(AccountStatus) (usedPercent float64, resetAt int64)) (float64, int64) {
